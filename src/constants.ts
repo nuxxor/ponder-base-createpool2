@@ -1,9 +1,25 @@
+import "./env";
+
+const DEFAULT_ANCHORS = [
+  "0x4200000000000000000000000000000000000006", // WETH
+  "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", // USDC
+  "0xd9aeec8b45db9eccbdf4c21bbfb9333d5859159f", // USDbC (bridged USDC)
+];
+
+export const VIRTUAL_TOKEN_ADDRESS =
+  process.env.VIRTUAL_TOKEN_ADDRESS?.toLowerCase() ?? null;
+
+const EXTRA_ANCHORS = (process.env.BASE_EXTRA_ANCHORS ?? "")
+  .split(",")
+  .map((addr) => addr.trim().toLowerCase())
+  .filter((addr) => /^0x[a-f0-9]{40}$/.test(addr));
+
+if (VIRTUAL_TOKEN_ADDRESS) {
+  EXTRA_ANCHORS.push(VIRTUAL_TOKEN_ADDRESS);
+}
+
 export const BASE_ANCHOR_TOKENS = new Set(
-  [
-    "0x4200000000000000000000000000000000000006", // WETH
-    "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", // USDC
-    "0xd9aeec8b45db9eccbdf4c21bbfb9333d5859159f", // USDbC (bridged USDC)
-  ].map((address) => address.toLowerCase()),
+  [...DEFAULT_ANCHORS, ...EXTRA_ANCHORS].map((address) => address.toLowerCase()),
 );
 
 export const WATCH_DATA_DIR = "data";

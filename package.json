@@ -8,13 +8,15 @@
     "start": "ponder start",
     "db": "ponder db",
     "codegen": "ponder codegen",
-    "lint": "eslint .",
+    "lint": "eslint . --ext .ts,.tsx",
     "typecheck": "tsc",
-    "monitor": "tsx src/monitor.ts"
+    "monitor": "tsx src/monitor.ts",
+    "poll:launchpads": "tsx src/pipelines/launchpads.ts",
+    "test:social-gate": "TMPDIR=./tmp node --import tsx/esm scripts/testSocialGate.ts"
   },
   "dependencies": {
-    "ponder": "^0.14.13",
     "hono": "^4.5.0",
+    "ponder": "^0.14.13",
     "viem": "^2.21.3"
   },
   "devDependencies": {
@@ -22,7 +24,7 @@
     "eslint": "^8.53.0",
     "eslint-config-ponder": "^0.14.13",
     "tsx": "^4.19.1",
-    "typescript": "^5.2.2"
+    "typescript": "5.3.3"
   },
   "engines": {
     "node": ">=18.14"

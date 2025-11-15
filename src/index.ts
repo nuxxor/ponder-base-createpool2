@@ -1,9 +1,15 @@
 import { ponder } from "ponder:registry";
 import schema from "ponder:schema";
 
-import { BASE_ANCHOR_TOKENS } from "./constants";
+import { BASE_ANCHOR_TOKENS, VIRTUAL_TOKEN_ADDRESS } from "./constants";
 import { normalizeAddress } from "./utils/address";
-import { trackTokenCandidate } from "./utils/watchlist";
+import {
+  trackTokenCandidate,
+  upsertNewTokenCandidate,
+} from "./utils/watchlist";
+
+const ENABLE_POOL_TRACKING =
+  String(process.env.ENABLE_POOL_TRACKING ?? "false").toLowerCase() === "true";
 
 type PoolCreationExtras = {
   protocol: string;
@@ -52,6 +58,7 @@ const detectNovelToken = (
   | {
       novel: `0x${string}`;
       quote: `0x${string}`;
+      anchor: `0x${string}`;
     }
   | undefined => {
   const t0 = normalizeAddress(token0);
@@ -60,11 +67,11 @@ const detectNovelToken = (
   const token1IsAnchor = BASE_ANCHOR_TOKENS.has(t1);
 
   if (token0IsAnchor && !token1IsAnchor) {
-    return { novel: token1, quote: token0 };
+    return { novel: token1, quote: token0, anchor: token0 };
   }
 
   if (token1IsAnchor && !token0IsAnchor) {
-    return { novel: token0, quote: token1 };
+    return { novel: token0, quote: token1, anchor: token1 };
   }
 
   return undefined;
@@ -75,6 +82,9 @@ const maybeTrackNovelToken = async (
     event: HandlerArgs["event"];
   },
 ) => {
+  if (!ENABLE_POOL_TRACKING) {
+    return;
+  }
   const candidate = detectNovelToken(params.token0, params.token1);
   if (!candidate) return;
 
@@ -87,6 +97,29 @@ const maybeTrackNovelToken = async (
     blockNumber: Number(params.event.block.number),
     blockTimestamp: Number(params.event.block.timestamp),
   });
+
+  if (
+    VIRTUAL_TOKEN_ADDRESS &&
+    candidate.anchor === VIRTUAL_TOKEN_ADDRESS &&
+    params.event.block.timestamp
+  ) {
+    const lpTime = new Date(
+      Number(params.event.block.timestamp) * 1000,
+    ).toISOString();
+    await upsertNewTokenCandidate({
+      platform: "virtuals",
+      identity: { platform: "virtuals" },
+      token: {
+        chainId: 8453,
+        address: candidate.novel,
+        quote: candidate.quote,
+        poolAddress: params.pool,
+        factory: params.event.log.address as `0x${string}`,
+        createdAt: lpTime,
+      },
+      schedule: { lpDeployedAt: lpTime, source: "virtuals" },
+    });
+  }
 };
 
 ponder.on("UniswapV2Factory:PairCreated", async ({ event, context }) => {

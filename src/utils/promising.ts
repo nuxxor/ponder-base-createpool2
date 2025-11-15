@@ -4,6 +4,7 @@ import path from "node:path";
 import {
   EvaluationResult,
   TokenMetricsSnapshot,
+  readWatchlist,
 } from "./watchlist";
 import { CommunityLinks } from "../types/community";
 import { WATCH_DATA_DIR, PROMISING_TOKENS_FILE } from "../constants";
@@ -48,7 +49,7 @@ export type PromisingToken = {
 const readPromisingMap = async (): Promise<PromisingMap> => {
   try {
     const raw = await fs.readFile(promisingPath, "utf8");
-    return JSON.parse(raw) as PromisingMap;
+    return prunePromisingToWatchlist(JSON.parse(raw) as PromisingMap);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       await ensureDataDir();
@@ -93,6 +94,25 @@ const writePromisingMap = async (map: PromisingMap) => {
     await fs.writeFile(tmpPath, payload, "utf8");
     await fs.rename(tmpPath, promisingPath);
   });
+};
+
+const prunePromisingToWatchlist = async (
+  map: PromisingMap,
+): Promise<PromisingMap> => {
+  const watchlist = await readWatchlist();
+  const allowedTokens = new Set(Object.keys(watchlist.tokens));
+  const removed = Object.keys(map).filter((token) => !allowedTokens.has(token));
+  if (removed.length === 0) {
+    return map;
+  }
+  for (const token of removed) {
+    delete map[token];
+  }
+  console.warn(
+    `[promising] Removed ${removed.length} token(s) missing from watchlist`,
+  );
+  await writePromisingMap(map);
+  return map;
 };
 
 export const upsertPromisingToken = async (

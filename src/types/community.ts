@@ -10,5 +10,7 @@ export type CommunityLinks = {
   twitter?: string;
   telegram?: string;
   discord?: string;
+  github?: string;
   socials?: SocialLink[];
+  raw?: SocialLink[];
 };

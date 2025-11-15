@@ -10,8 +10,7 @@ import { UniswapV3FactoryAbi } from "./abis/UniswapV3FactoryAbi";
 const FALLBACK_START_BLOCK = 38_050_000;
 
 const baseRpcUrl =
-  process.env.PONDER_RPC_URL_8453 ??
-  "https://go.getblock.io/9297461fd5214756a023f1b0c8860aef";
+  process.env.PONDER_RPC_URL_8453 ?? "https://mainnet.base.org";
 
 let dynamicStartBlock = FALLBACK_START_BLOCK;
 

@@ -1,3 +1,4 @@
+import "./env";
 import {
   DEFAULT_POLL_INTERVAL_MS,
   DROP_LIQUIDITY_THRESHOLD_USD,
@@ -26,6 +27,7 @@ import {
   readWatchlist,
   WatchEntry,
   updateWatchlist,
+  mergeCommunityLinks,
 } from "./utils/watchlist";
 import {
   removePromisingToken,
@@ -33,11 +35,15 @@ import {
 } from "./utils/promising";
 import { analyzeLpLockV2, fetchOwnerAddress } from "./basescan";
 import { normalizeAddress } from "./utils/address";
+import { refreshExternalSources } from "./pipelines/launchpads";
+import { enforcePromisingSocialGate } from "./utils/socialProof";
 
 const sleep = (ms: number) =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
-const REQUEST_DELAY_MS = 300;
+const REQUEST_DELAY_MS = Number(
+  process.env.DEXSCREENER_REQUEST_DELAY_MS ?? 1200,
+);
 const RENOUNCED_ADDRESSES = new Set(
   [
     "0x0000000000000000000000000000000000000000",
@@ -290,7 +296,10 @@ const recordSnapshot = async (
 
     entry.lastSnapshotAt = snapshot.metrics.collectedAt;
     entry.lastMetrics = snapshot.metrics;
-    entry.community = snapshot.metrics.community;
+    entry.community = mergeCommunityLinks(
+      entry.community,
+      snapshot.metrics.community,
+    );
     entry.consecutiveHealthyCycles = meta?.consecutiveHealthyCycles ?? 0;
     entry.lastLiquidityUsd =
       meta?.lastLiquidityUsd ?? snapshot.metrics.totalLiquidityUsd;
@@ -316,6 +325,7 @@ const recordSnapshot = async (
 };
 
 const runCycle = async () => {
+  await refreshExternalSources();
   const watchlist = await readWatchlist();
   const activeEntries = Object.values(watchlist.tokens).filter(
     (entry) => entry.status === "active",
@@ -408,13 +418,36 @@ const runCycle = async () => {
       },
     );
 
-    const qualifies =
+    const qualifiesBase =
       shouldIncrement && nextHealthy >= MIN_CONSECUTIVE_HEALTHY_CYCLES;
+    let qualifies = qualifiesBase;
+    let socialReasons: string[] = [];
+    if (qualifies) {
+      try {
+        const gate = await enforcePromisingSocialGate(entry);
+        if (!gate.passes) {
+          qualifies = false;
+          socialReasons = gate.reasons;
+          console.info(
+            `[monitor] ${entry.token} social gate blocked: ${gate.reasons.join("; ") || "unknown reason"}`,
+          );
+        }
+      } catch (error) {
+        qualifies = false;
+        socialReasons = [(error as Error).message];
+        console.warn(
+          `[monitor] Social gate error for ${entry.token}: ${(error as Error).message}`,
+        );
+      }
+    }
 
     if (qualifies) {
       await upsertPromisingToken(entry.token, metrics, evaluation);
     } else {
       await removePromisingToken(entry.token);
+      if (socialReasons.length > 0) {
+        entry.notes = socialReasons.join("; ");
+      }
     }
 
     console.info(
