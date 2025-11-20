@@ -43,7 +43,9 @@ const CLANKER_API_KEY = process.env.CLANKER_API_KEY;
 const NEYNAR_API_KEY = process.env.NEYNAR_API_KEY;
 const ZORA_API_KEY = process.env.ZORA_API_KEY;
 const ZORA_API_BASE =
-  process.env.ZORA_API_BASE ?? "https://api-sdk.zora.engineering/api";
+  process.env.ZORA_API_BASE ?? "https://api-sdk.zora.engineering";
+const ZORA_API_BASE_FALLBACK =
+  process.env.ZORA_API_BASE_FALLBACK ?? "https://api-sdk.zora.co";
 
 const BASE_ROOT = path.resolve(process.cwd(), "..");
 const SMART_SCRIPT_PATH = path.join(
@@ -307,27 +309,53 @@ const fetchZoraCreator = async (token: string) => {
   if (!ZORA_API_KEY) {
     throw new Error("ZORA_API_KEY is not configured");
   }
-  const url = new URL("/coin", ZORA_API_BASE);
-  url.searchParams.set("address", token);
-  url.searchParams.set("chain", "8453");
-  const res = await fetch(url, {
-    headers: { "api-key": ZORA_API_KEY, Accept: "application/json" },
-  });
-  if (res.status === 404) {
-    return null;
+  const bases = [ZORA_API_BASE, ZORA_API_BASE_FALLBACK]
+    .map((v) => v.replace(/\/$/, ""))
+    .filter((v, i, self) => v && self.indexOf(v) === i);
+
+  let lastError: Error | undefined;
+  for (const base of bases) {
+    try {
+      const url = new URL("/coin", base);
+      url.searchParams.set("address", token);
+      url.searchParams.set("chain", "8453");
+      const res = await fetch(url, {
+        headers: { "api-key": ZORA_API_KEY, Accept: "application/json" },
+      });
+      const text = await res.text();
+      if (res.status === 404) {
+        continue; // try next base
+      }
+      if (!res.ok) {
+        lastError = new Error(`Zora HTTP ${res.status}: ${text.slice(0, 120)}`);
+        continue;
+      }
+      let json: any;
+      try {
+        json = JSON.parse(text);
+      } catch (err) {
+        lastError = new Error(
+          `Zora non-JSON response (${res.status}): ${text.slice(0, 120)}`,
+        );
+        continue;
+      }
+      const farcaster =
+        json?.data?.zora20Token?.creatorProfile?.socialAccounts?.farcaster;
+      return {
+        fid: farcaster?.id ?? farcaster?.fid ?? null,
+        handle: farcaster?.username ?? null,
+        followers: farcaster?.followerCount ?? null,
+        creatorVisible: Boolean(farcaster?.username || farcaster?.id),
+      };
+    } catch (err) {
+      lastError = err as Error;
+      continue;
+    }
   }
-  if (!res.ok) {
-    throw new Error(`Zora HTTP ${res.status}`);
+  if (lastError) {
+    throw lastError;
   }
-  const json = (await res.json()) as any;
-  const farcaster =
-    json?.data?.zora20Token?.creatorProfile?.socialAccounts?.farcaster;
-  return {
-    fid: farcaster?.id ?? farcaster?.fid ?? null,
-    handle: farcaster?.username ?? null,
-    followers: farcaster?.followerCount ?? null,
-    creatorVisible: Boolean(farcaster?.username || farcaster?.id),
-  };
+  return null;
 };
 
 export const refreshCreatorVerification = async (

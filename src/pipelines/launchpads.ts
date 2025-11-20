@@ -1,7 +1,8 @@
 import "../env";
-import { upsertNewTokenCandidate } from "../utils/watchlist";
+import { upsertNewTokenCandidate, upsertScore } from "../utils/watchlist";
 import { fetchRecentClankerCandidates } from "../connectors/clanker";
 import { buildZoraCandidates } from "../connectors/zora";
+import { scoreClanker } from "../utils/scoring";
 
 const EXTERNAL_REFRESH_INTERVAL_MS =
   Number(process.env.EXTERNAL_REFRESH_INTERVAL_MS) || 5 * 60 * 1000;
@@ -35,6 +36,19 @@ export const refreshExternalSources = async () => {
       const candidates = result.value ?? [];
       for (const candidate of candidates) {
         await upsertNewTokenCandidate(candidate);
+        if (
+          candidate.platform === "clanker" &&
+          candidate.identity?.launchCount !== undefined
+        ) {
+          const score = scoreClanker({
+            farcaster: {
+              fid: candidate.identity?.creatorFid,
+              developerLaunchCount: candidate.identity?.launchCount,
+            },
+            twitter: undefined,
+          });
+          await upsertScore(candidate.token.address, score);
+        }
       }
     }
   } finally {

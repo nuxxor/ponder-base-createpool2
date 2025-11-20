@@ -19,6 +19,7 @@ import {
   SocialStat,
   TokenMeta,
 } from "../types/newToken";
+import { ScoreResult } from "../types/score";
 import { normalizeAddress } from "./address";
 
 const WATCHLIST_ALLOWED_PLATFORMS = new Set(
@@ -93,6 +94,7 @@ export type WatchEntry = {
   schedule?: LaunchSchedule;
   tokenMeta?: TokenMeta;
   labels?: string[];
+  scores?: Record<string, ScoreResult>;
 };
 
 export type Watchlist = {
@@ -560,6 +562,17 @@ export const appendSnapshotRecord = async (record: SnapshotRecord) => {
   const line = JSON.stringify(record);
   await runWithFileLock(snapshotPath, async () => {
     await fs.appendFile(snapshotPath, line + "\n", "utf8");
+  });
+};
+
+export const upsertScore = async (token: string, score: ScoreResult) => {
+  const normalizedToken = normalizeAddress(token);
+  await updateWatchlist((watchlist) => {
+    const entry = watchlist.tokens[normalizedToken];
+    if (!entry) return;
+    entry.scores = entry.scores ?? {};
+    entry.scores[score.platform] = score;
+    return watchlist;
   });
 };
 const mergeSocialStat = (

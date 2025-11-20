@@ -14,6 +14,15 @@ const TARGET =
   process.argv[2] ??
   "0x5a9f1c6d01a860aa5d039c1834c11a8debc2d90c";
 
+import { fileURLToPath } from "node:url";
+import path from "node:path";
+import dotenv from "dotenv";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+dotenv.config({ path: path.join(__dirname, "..", ".env.local") });
+dotenv.config();
+
 const fetchJsonText = async (url: string, headers: Record<string, string>) => {
   const res = await fetch(url, { headers });
   const body = await res.text();
@@ -25,25 +34,57 @@ const fetchJsonText = async (url: string, headers: Record<string, string>) => {
       `Failed to parse JSON from ${url} :: ${(err as Error).message} :: body=${body.slice(0, 200)}`,
     );
   }
-  return json;
+  return { json, status: res.status };
 };
 
 async function fetchZoraCreator(address: string) {
   const apiKey = process.env.ZORA_API_KEY;
   if (!apiKey) throw new Error("ZORA_API_KEY missing");
-  const url = new URL("https://api-sdk.zora.engineering/api/coin");
-  url.searchParams.set("address", address);
-  url.searchParams.set("chain", "8453");
-  const json = await fetchJsonText(url.toString(), {
-    "api-key": apiKey,
-    Accept: "application/json",
-  });
-  const fc =
-    json?.data?.zora20Token?.creatorProfile?.socialAccounts?.farcaster ?? null;
-  return {
-    farcaster: fc,
-    raw: json,
-  };
+  const bases = [
+    "https://api-sdk.zora.engineering",
+  ];
+  let lastError: Error | undefined;
+  for (const base of bases) {
+    const url = new URL("/coin", base);
+    url.searchParams.set("address", address);
+    url.searchParams.set("chain", "8453");
+    try {
+      const res = await fetch(url.toString(), {
+        headers: { "api-key": apiKey, Accept: "application/json" },
+      });
+      const text = await res.text();
+      if (res.status === 404) {
+        lastError = new Error("Zora 404");
+        continue;
+      }
+      if (!res.ok) {
+        lastError = new Error(
+          `Zora HTTP ${res.status}: ${text.slice(0, 200)}`,
+        );
+        continue;
+      }
+      let json: any;
+      try {
+        json = JSON.parse(text);
+      } catch (err) {
+        lastError = new Error(
+          `Zora non-JSON (${res.status}): ${text.slice(0, 200)}`,
+        );
+        continue;
+      }
+      const token = json?.data?.zora20Token;
+      const fc =
+        token?.creatorProfile?.socialAccounts?.farcaster ??
+        token?.creatorProfile?.link3?.farcaster ??
+        null;
+      return { farcaster: fc, raw: json };
+    } catch (err) {
+      lastError = err as Error;
+      continue;
+    }
+  }
+  if (lastError) throw lastError;
+  return { farcaster: null, raw: null };
 }
 
 async function fetchNeynar(fid: string | number) {
