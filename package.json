@@ -12,7 +12,8 @@
     "typecheck": "tsc",
     "monitor": "tsx src/monitor.ts",
     "poll:launchpads": "tsx src/pipelines/launchpads.ts",
-    "test:social-gate": "TMPDIR=./tmp node --import tsx/esm scripts/testSocialGate.ts"
+    "test:social-gate": "TMPDIR=./tmp node --import tsx/esm scripts/testSocialGate.ts",
+    "test:neynar-score": "node --import tsx/esm scripts/testNeynarScore.ts"
   },
   "dependencies": {
     "hono": "^4.5.0",

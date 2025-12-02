@@ -26,6 +26,7 @@ export type FarcasterSignals = {
   topTraderFollowers?: number;
   active24hFollowers?: number;
   developerLaunchCount?: number;
+  neynarScore?: number;
 };
 
 export type TwitterSignals = {

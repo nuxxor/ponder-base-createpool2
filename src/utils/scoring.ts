@@ -41,6 +41,14 @@ const buildBlock = (
 };
 
 const computeFarcasterBlock = (signals: FarcasterSignals | undefined) => {
+  const neynar = signals?.neynarScore;
+  if (neynar !== undefined && neynar !== null) {
+    const clamped = Math.max(0, Math.min(1, neynar));
+    const block = buildBlock("fc_neynar_score", clamped, 1, 1, 1);
+    const score = clamped * 50; // Farcaster block contributes up to 50 via Neynar score
+    return { score, blocks: [block] };
+  }
+
   const devLaunchCount = signals?.developerLaunchCount;
   const devRaw =
     devLaunchCount === undefined

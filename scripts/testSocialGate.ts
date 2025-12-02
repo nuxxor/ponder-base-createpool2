@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 
+process.env.SKIP_ENV_FILES = "true";
 process.env.PROMISING_TWITTER_MIN_FOLLOWERS = "100";
 process.env.PROMISING_FARCASTER_MIN_FOLLOWERS = "200";
+process.env.PROMISING_CREATOR_MIN_FOLLOWERS = "300";
 process.env.TWITTER_API_KEY = process.env.TWITTER_API_KEY ?? "test-key";
 process.env.CLANKER_API_KEY = "test-clanker";
 process.env.NEYNAR_API_KEY = "test-neynar";
 process.env.ZORA_API_KEY = "test-zora";
+process.env.MIN_NEYNAR_SCORE = "0.55";
 process.env.SMART_FOLLOWER_AUTO_RUN = "false";
 
 type JsonResponse = {
@@ -31,6 +34,11 @@ const farcasterMap: Record<string, number> = {
   "43": 500,
 };
 
+const neynarScoreMap: Record<string, number> = {
+  "42": 0.3,
+  "43": 0.9,
+};
+
 globalThis.fetch = (async (input: RequestInfo | URL) => {
   const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
   if (url.includes("twitterapi.io")) {
@@ -53,6 +61,11 @@ globalThis.fetch = (async (input: RequestInfo | URL) => {
     });
   }
   if (url.includes("api.neynar.com")) {
+    if (url.includes("/v2/farcaster/user/bulk")) {
+      const fid = new URL(url).searchParams.get("fids") ?? "";
+      const score = neynarScoreMap[fid] ?? null;
+      return createResponse({ users: [{ fid: Number(fid), score }] });
+    }
     return createResponse({
       users: [
         {

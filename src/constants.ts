@@ -48,6 +48,10 @@ export const BASESCAN_API_URL = "https://api.basescan.org/v2/api";
 export const BASESCAN_API_KEY =
   process.env.BASESCAN_API_KEY ?? "UA3SCUYC6D3IVBP9E4613ES89KEQNJR27X";
 export const BASESCAN_MIN_DELAY_MS = 250; // 4 req/s (~5 req/s limit)
+export const MIN_NEYNAR_SCORE = Number(process.env.MIN_NEYNAR_SCORE ?? 0.55);
+export const NEYNAR_SCORE_CACHE_TTL_MS = Number(
+  process.env.NEYNAR_SCORE_CACHE_TTL_MS ?? 6 * 60 * 60 * 1000,
+); // default 6h
 export const LOCK_DESTINATIONS = [
   "0x0000000000000000000000000000000000000000",
   "0x000000000000000000000000000000000000dead",

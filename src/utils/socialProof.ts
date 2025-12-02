@@ -10,19 +10,18 @@ import {
   SmartFollowerReport,
   SocialStat,
 } from "../types/newToken";
+import { MIN_NEYNAR_SCORE } from "../constants";
+import { getNeynarScoreByFid } from "../clients/neynar";
 
-const MIN_TWITTER_FOLLOWERS = Number(
-  process.env.PROMISING_TWITTER_MIN_FOLLOWERS ?? 5000,
-);
-const MIN_FARCASTER_FOLLOWERS = Number(
-  process.env.PROMISING_FARCASTER_MIN_FOLLOWERS ?? 2000,
-);
+const getMinTwitterFollowers = () =>
+  Number(process.env.PROMISING_TWITTER_MIN_FOLLOWERS ?? 5000);
+const getMinFarcasterFollowers = () =>
+  Number(process.env.PROMISING_FARCASTER_MIN_FOLLOWERS ?? 2000);
 const SOCIAL_STATS_TTL_MS = Number(
   process.env.SOCIAL_STATS_TTL_MS ?? 6 * 60 * 60 * 1000,
 );
-const MIN_CREATOR_FOLLOWERS = Number(
-  process.env.PROMISING_CREATOR_MIN_FOLLOWERS ?? 300,
-);
+const getMinCreatorFollowers = () =>
+  Number(process.env.PROMISING_CREATOR_MIN_FOLLOWERS ?? 300);
 const CREATOR_VERIFICATION_TTL_MS = Number(
   process.env.CREATOR_VERIFICATION_TTL_MS ?? SOCIAL_STATS_TTL_MS,
 );
@@ -61,6 +60,7 @@ export type SocialGateResult = {
     twitter?: SocialStat;
     farcaster?: SocialStat;
     creator?: CreatorVerification;
+    neynarScore?: number | null;
   };
 };
 
@@ -422,7 +422,7 @@ export const refreshCreatorVerification = async (
 
   const condFollowers =
     typeof followerSource === "number" &&
-    followerSource >= MIN_CREATOR_FOLLOWERS;
+    followerSource >= getMinCreatorFollowers();
   const condClanker =
     clankerData?.requestorFid !== undefined &&
     clankerData.requestorFid !== null &&
@@ -441,7 +441,7 @@ export const refreshCreatorVerification = async (
 
   if (!condFollowers) {
     reasons.push(
-      `Farcaster followers ${followerSource ?? "unknown"} < ${MIN_CREATOR_FOLLOWERS}`,
+      `Farcaster followers ${followerSource ?? "unknown"} < ${getMinCreatorFollowers()}`,
     );
   }
   if (!condZoraVisible) reasons.push("Zora creator missing");
@@ -534,6 +534,7 @@ export const enforcePromisingSocialGate = async (
   entry: WatchEntry,
 ): Promise<SocialGateResult> => {
   const reasons: string[] = [];
+  let neynarScore: number | null = null;
   const twitterHandle = extractTwitterHandle(entry);
   if (!twitterHandle) {
     return {
@@ -550,14 +551,17 @@ export const enforcePromisingSocialGate = async (
 
   let passes = true;
 
-  if (!twitterStat?.followers || twitterStat.followers < MIN_TWITTER_FOLLOWERS) {
+  if (
+    !twitterStat?.followers ||
+    twitterStat.followers < getMinTwitterFollowers()
+  ) {
     passes = false;
     const followerText =
       twitterStat?.followers !== null && twitterStat?.followers !== undefined
         ? twitterStat.followers
         : "unknown";
     reasons.push(
-      `Twitter followers ${followerText} < ${MIN_TWITTER_FOLLOWERS}`,
+      `Twitter followers ${followerText} < ${getMinTwitterFollowers()}`,
     );
   }
   if (twitterStat?.error) {
@@ -567,7 +571,7 @@ export const enforcePromisingSocialGate = async (
   if (farcasterFid) {
     if (
       !farcasterStat?.followers ||
-      farcasterStat.followers < MIN_FARCASTER_FOLLOWERS
+      farcasterStat.followers < getMinFarcasterFollowers()
     ) {
       passes = false;
       const followerText =
@@ -576,11 +580,26 @@ export const enforcePromisingSocialGate = async (
           ? farcasterStat.followers
           : "unknown";
       reasons.push(
-        `Farcaster followers ${followerText} < ${MIN_FARCASTER_FOLLOWERS}`,
+        `Farcaster followers ${followerText} < ${getMinFarcasterFollowers()}`,
       );
     }
     if (farcasterStat?.error) {
       reasons.push(`Farcaster fetch error: ${farcasterStat.error}`);
+    }
+    try {
+      neynarScore = await getNeynarScoreByFid(farcasterFid);
+      if (neynarScore === null) {
+        passes = false;
+        reasons.push("Neynar score unavailable");
+      } else if (neynarScore < MIN_NEYNAR_SCORE) {
+        passes = false;
+        reasons.push(
+          `Neynar score ${neynarScore.toFixed(3)} < ${MIN_NEYNAR_SCORE}`,
+        );
+      }
+    } catch (error) {
+      passes = false;
+      reasons.push(`Neynar score error: ${(error as Error).message}`);
     }
   }
 
@@ -613,6 +632,7 @@ export const enforcePromisingSocialGate = async (
       twitter: twitterStat,
       farcaster: farcasterStat,
       creator: creatorCheck,
+      neynarScore,
     },
   };
 };

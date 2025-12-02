@@ -11,13 +11,18 @@ const defaultEnvFiles = [
   path.resolve(cwd, ".env.local"),
 ];
 
-const envFiles = [
-  ...defaultEnvFiles,
-  customEnv ? path.resolve(cwd, customEnv) : undefined,
-].filter(Boolean) as string[];
+const skipEnvFiles =
+  String(process.env.SKIP_ENV_FILES ?? "false").toLowerCase() === "true";
 
-for (const envPath of envFiles) {
-  if (fs.existsSync(envPath)) {
-    config({ path: envPath, override: true });
+if (!skipEnvFiles) {
+  const envFiles = [
+    ...defaultEnvFiles,
+    customEnv ? path.resolve(cwd, customEnv) : undefined,
+  ].filter(Boolean) as string[];
+
+  for (const envPath of envFiles) {
+    if (fs.existsSync(envPath)) {
+      config({ path: envPath, override: true });
+    }
   }
 }
