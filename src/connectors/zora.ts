@@ -5,6 +5,7 @@ import { findSmartFollower } from "../utils/smartFollowers";
 
 const ZORA_API = "https://api-sdk.zora.engineering";
 const ZORA_API_KEY = process.env.ZORA_API_KEY;
+const ZORA_EXPLORE_COUNT = Number(process.env.ZORA_EXPLORE_COUNT ?? 200);
 
 type ExploreEdge = {
   node: {
@@ -43,7 +44,7 @@ const request = async (path: string, params: Record<string, string>) => {
   return res.json();
 };
 
-export const fetchZoraExploreNew = async (count = 20) => {
+export const fetchZoraExploreNew = async (count = ZORA_EXPLORE_COUNT) => {
   const json = (await request("/explore", {
     listType: "NEW",
     count: String(count),
@@ -142,7 +143,7 @@ const fetchZoraProfileTwitter = async (address: `0x${string}`) => {
 };
 
 export const buildZoraCandidates = async (
-  count = 20,
+  count = ZORA_EXPLORE_COUNT,
 ): Promise<NewTokenCandidate[]> => {
   if (!ZORA_API_KEY) {
     console.warn(

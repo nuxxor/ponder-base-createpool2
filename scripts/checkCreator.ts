@@ -107,10 +107,10 @@ async function main() {
     console.log("zora farcaster:", zora.farcaster ?? "none");
 
     const fid = zora.farcaster?.id ?? zora.farcaster?.fid;
-    if (fid) {
+      if (fid) {
       try {
         const neynar = await fetchNeynar(fid);
-        console.log("neynar user:", neynar?.users?.[0] ?? "none");
+        console.log("neynar user:", neynar.json?.users?.[0] ?? "none");
       } catch (err) {
         console.error("neynar error:", (err as Error).message);
       }

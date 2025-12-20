@@ -8,7 +8,7 @@ process.env.TWITTER_API_KEY = process.env.TWITTER_API_KEY ?? "test-key";
 process.env.CLANKER_API_KEY = "test-clanker";
 process.env.NEYNAR_API_KEY = "test-neynar";
 process.env.ZORA_API_KEY = "test-zora";
-process.env.MIN_NEYNAR_SCORE = "0.55";
+process.env.MIN_NEYNAR_SCORE = "0.70";
 process.env.SMART_FOLLOWER_AUTO_RUN = "false";
 
 type JsonResponse = {
@@ -39,7 +39,7 @@ const neynarScoreMap: Record<string, number> = {
   "43": 0.9,
 };
 
-globalThis.fetch = (async (input: RequestInfo | URL) => {
+globalThis.fetch = (async (input: any) => {
   const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
   if (url.includes("twitterapi.io")) {
     const handle = new URL(url).searchParams.get("userName") ?? "";
@@ -101,7 +101,7 @@ const { enforcePromisingSocialGate } = await import("../src/utils/socialProof");
 type MinimalEntry = {
   token: string;
   community?: { twitter?: string };
-  identity?: { platform?: string; creatorFid?: number };
+  identity?: { platform?: string; creatorFid?: number; twitter?: string };
 };
 
 const wrapEntry = (entry: MinimalEntry) => ({

@@ -1,151 +1,356 @@
-# Ponder Base CreatePool Monitor
+# Ponder Base Token Sniper
 
-Dex pool creation indexer + off-chain monitor for Base. Tracks Uniswap V2/V3 and Aerodrome V2/Slipstream pool creations, seeds a watchlist of novel tokens, polls Dexscreener for liquidity/flow/price signals, enforces social gates, and emits “promising” tokens for follow-up.
+Real-time token sniper bot for Base blockchain. Detects new token launches on Clanker and Zora platforms within seconds, validates creator quality via Neynar score, and sends instant Telegram alerts.
 
-## What this repo does
-- **Index pool creations** via Ponder from Base factories (Uni V2/V3, Aerodrome V2/CL) into the `pool_creation` table (schema in `ponder.schema.ts`).
-- **Detect novel tokens** against anchor tokens (WETH/USDC/USDbC + optional extras/Virtuals), then add them to a JSON watchlist with pool/quote metadata.
-- **Poll Dexscreener** for each active token, aggregate liquidity/volume/txn counts/price change, evaluate health, and drop or keep tokens with streak tracking.
-- **Enforce social gates** (Twitter + optional Farcaster + creator verification via Clanker/Zora/Neynar) before marking a token as “promising”.
-- **Check security** via BaseScan: owner() renounce check and LP lock heuristics (burn/locker destinations) for V2 pools.
-- **Poll launchpads** (Clanker + Zora) to ingest fresh candidates and precompute scores.
-- **Expose APIs** through Hono + Ponder’s built-in SQL/GraphQL routes.
+## Features
 
-## Stack
-- Ponder (`ponder.config.ts`, `src/index.ts`) for on-chain indexing
-- TypeScript, viem for RPC
-- Hono for API surface
-- File-backed state under `data/` (`watchlist.json`, `dex_snapshots.ndjson`, `promising.json`)
+- **Real-time Detection**: WebSocket connection to local Base node for ~0ms latency
+- **Factory Monitoring**: Direct event subscription to Clanker and Zora factories
+- **Creator Validation**: Neynar score and Farcaster follower checks
+- **Instant Alerts**: Telegram notifications within 2-3 seconds of token creation
+- **Backup Monitor**: Polling-based monitor for comprehensive token tracking
 
-## Data & Schema
-- **Table** `pool_creation` (`ponder.schema.ts`): id, protocol, factoryAddress, transactionHash, blockNumber, blockTimestamp, logIndex, token0/1, poolAddress, stable?, feeTier?, tickSpacing?, poolSequence?.
-- **Watchlist** (`data/watchlist.json`): tokens keyed by address, with status, pools, quoteTokens, identity, community, security, metrics snapshots, scores, notes.
-- **Snapshots** (`data/dex_snapshots.ndjson`): append-only JSON lines of metrics + evaluation decisions per cycle.
-- **Promising** (`data/promising.json`): tokens that pass health streak + social gate, with latest metrics/evaluation/community.
+## Architecture
 
-## Key flows
-### On-chain indexing (`src/index.ts`)
-1. Ponder handlers subscribe to:
-   - `UniswapV2Factory:PairCreated`
-   - `UniswapV3Factory:PoolCreated`
-   - `AerodromeV2Factory:PoolCreated`
-   - `AerodromeCLFactory:PoolCreated`
-2. For each event: build payload (protocol, tokens, pool address, fee/stable/tickSpacing/sequence), insert into `pool_creation`.
-3. If `ENABLE_POOL_TRACKING=true`: detect if exactly one side is an anchor token. If so, track the novel token:
-   - Add/merge watchlist entry with pool/quote/factory metadata.
-   - If `VIRTUAL_TOKEN_ADDRESS` is the anchor and timestamp exists, upsert Virtuals candidate with schedule metadata.
+```
+┌─────────────────────────────────────────────────────────────┐
+│           FULL NODE WebSocket (localhost:18546)             │
+│                    ~0ms latency                             │
+└─────────────────────────────┬───────────────────────────────┘
+                              │
+           ┌──────────────────┼──────────────────┐
+           ▼                  ▼                  ▼
+    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+    │  Clanker    │    │    Zora     │    │  Uniswap/   │
+    │  Factory    │    │   Factory   │    │  Aerodrome  │
+    └──────┬──────┘    └──────┬──────┘    └──────┬──────┘
+           │                  │                  │
+           └──────────────────┴──────────────────┘
+                              │
+                        Pool Created!
+                              │
+                              ▼
+                 ┌────────────────────────┐
+                 │  Parallel Validation   │
+                 │  • Clanker API lookup  │
+                 │  • Neynar score check  │
+                 │  (~500ms)              │
+                 └────────────┬───────────┘
+                              │
+                              ▼
+                 ┌────────────────────────┐
+                 │   TELEGRAM ALERT       │
+                 │   + Auto-buy (TODO)    │
+                 └────────────────────────┘
 
-### Monitoring loop (`src/monitor.ts`)
-1. Loads env + thresholds from `src/constants.ts`.
-2. Periodically runs `runCycle` (interval `POLL_INTERVAL_MS` or default 5 min):
-   - Refresh external sources (launchpads; see below).
-   - Read active watchlist entries.
-   - For each token:
-     - Optionally refresh security (owner + LP lock) if stale.
-     - Fetch Dexscreener pairs (`fetchPairsForToken`) and aggregate:
-       liquidity USD (sum), volumes H1/H24, buys/sells H1/H24, weighted price, price change, best pair info, community links.
-     - Evaluate metrics against thresholds (liquidity/flow/buy-sell ratio/momentum, drop triggers like price crash, no trades, mcap/liquidity ratio, suspicious labels). Warnings/risk flags include owner not renounced, LP unlocked.
-     - Update watchlist snapshot (status active/dropped, notes, consecutive healthy cycles, last liquidity).
-     - If score >= `PROMISING_SCORE_THRESHOLD` for `MIN_CONSECUTIVE_HEALTHY_CYCLES` cycles, run social gate:
-       - Twitter follower min (`PROMISING_TWITTER_MIN_FOLLOWERS`)
-       - Farcaster follower min (`PROMISING_FARCASTER_MIN_FOLLOWERS`) if creator FID present
-       - Creator verification via Clanker + Zora + Neynar (FID alignment, verified msg_sender)
-       - Optional smart follower audit via external script
-     - If gate passes: upsert into promising set; else remove from promising and annotate notes.
-     - Sleep `DEXSCREENER_REQUEST_DELAY_MS` between tokens.
+               TOTAL: ~2-3 seconds
+```
 
-### Launchpad ingestion (`src/pipelines/launchpads.ts`)
-- Runs every `EXTERNAL_REFRESH_INTERVAL_MS` (default 5 min).
-- Fetches Clanker recent tokens (`src/connectors/clanker.ts`), resolves Farcaster identity (creator, verified addresses, smart account, launch count), normalizes community/security, schedules LP deployment time.
-- Fetches Zora explore list (`src/connectors/zora.ts`), enriches with Twitter (profile lookup) and smart follower hint.
-- Upserts candidates into watchlist. For Clanker, precompute score (`src/utils/scoring.ts`) based on Farcaster launch count and social signals.
+## Factory Addresses
 
-### Security checks (`src/basescan.ts`)
-- Calls BaseScan (rate-limited) to:
-  - `owner()`; marks renounced if burn/null address.
-  - LP lock for V2 pools: totalSupply vs balances at known burn/locker destinations (`LOCK_DESTINATIONS`), compute locked percent + breakdown.
-- V3/Slipstream pools marked as v3 (no lock math).
+| Platform | Factory Contract |
+|----------|------------------|
+| Clanker V4 | `0xE85A59c628F7d27878ACeB4bf3b35733630083a9` |
+| Zora | `0x777777751622c0d3258f214F9DF38E35BF45baF3` |
+| Uniswap V2 | `0x8909dc15e40173ff4699343b6eb8132c65e18ec6` |
+| Uniswap V3 | `0x33128a8fc17869897dce68ed026d694621f6fdfd` |
+| Aerodrome V2 | `0x420dd381b31aef6683db6b902084cb0ffece40da` |
+| Aerodrome CL | `0x5e7bb104d84c7cb9b682aac2f3d509f5f406809a` |
 
-### Social gate (`src/utils/socialProof.ts`)
-- Extract Twitter handle from identity/community links; fetch followers via `twitterapi.io`.
-- If creator FID present, fetch Farcaster followers via `api.farcaster.xyz`.
-- Creator verification:
-  - Clanker token creator (FID, msg_sender, platform).
-  - Zora coin creator Farcaster info.
-  - Neynar user lookup (follower count, verified eth addresses) to confirm msg_sender.
-- Enforce minimum followers; require creator alignment; optionally run smart follower audit script when passes.
-- Results cached with TTLs (social stats + creator verification).
+## Quick Start
 
-## Configuration (env)
-Load order: `../ai-pipeline/.env`, `.env`, `.env.local`, optional `DOTENV_PATH`.
+```bash
+# Install dependencies
+npm install
 
-Common vars:
-- `PONDER_RPC_URL_8453` (or fallback `https://mainnet.base.org`)
-- `ENABLE_POOL_TRACKING` (true/false)
-- `BASE_EXTRA_ANCHORS` (comma-separated addresses)
-- `VIRTUAL_TOKEN_ADDRESS`
-- `DEXSCREENER_REQUEST_DELAY_MS`, `POLL_INTERVAL_MS`
-- Social: `TWITTER_API_KEY`, `FARCASTER_API_KEY`, `FARCASTER_HUB_HTTP`, `NEYNAR_API_KEY`, `CLANKER_API_KEY`, `ZORA_API_KEY`, `SMART_FOLLOWER_AUTO_RUN`, `SMART_FOLLOWER_AUTO_REFRESH_MS`, `SOCIAL_STATS_TTL_MS`
-- Thresholds (override defaults in `src/constants.ts`):
-  - Liquidity/flow: `MIN_HEALTHY_LIQUIDITY_USD`, `MIN_BUYS_PER_HOUR`, `MIN_BUY_SELL_RATIO`
-  - Drop: `DROP_LIQUIDITY_THRESHOLD_USD`, `DROP_PRICE_CHANGE_THRESHOLD`, `LIQUIDITY_DROP_PERCENT`, `LIQUIDITY_DROP_MIN_BASE`
-  - Volume: `MIN_VOLUME_H1_USD`
-  - Promising: `PROMISING_SCORE_THRESHOLD`, `MIN_CONSECUTIVE_HEALTHY_CYCLES`
-  - Farcaster reputation: `MIN_NEYNAR_SCORE` (default 0.55), `NEYNAR_SCORE_CACHE_TTL_MS`
-  - Security: `MIN_LOCKED_LP_PERCENT`, `SECURITY_REFRESH_INTERVAL_MS`, `MAX_SECURITY_CHECKS_PER_CYCLE`
-- BaseScan: `BASESCAN_API_KEY`, `BASESCAN_MIN_DELAY_MS`
-- Watchlist gating: `WATCHLIST_ALLOWED_PLATFORMS` (default `zora,clanker`)
-- Paths: `SMART_FOLLOWERS_PATH` (JSON cache), `WATCH_DATA_DIR`, `PROMISING_TOKENS_FILE`, etc.
+# Configure environment
+cp .env.example .env.local
+# Edit .env.local with your API keys
+
+# Run sniper bot (real-time, recommended)
+npm run sniper
+
+# Or run monitor (polling-based backup)
+npm run monitor
+```
 
 ## Scripts
-- `npm run dev` / `npm run start`: Ponder dev/prod.
-- `npm run monitor`: run Dexscreener monitor loop.
-- `npm run poll:launchpads`: one-off external source refresh.
-- `npm run test:social-gate`: unit test for social gate logic (uses mocked fetch).
-- `npm run test:neynar-score`: fetch Neynar user score for provided FIDs.
-- `npm run codegen`, `npm run lint`, `npm run typecheck`.
-- Utility scripts:
-  - `scripts/testRpc.ts`: RPC sanity check.
-  - `scripts/checkCreator.ts`: inspect creator info via Zora + Neynar.
-  - `scripts/listZoraCoins.ts`: scan ZoraFactory events on Base.
 
-## Directory tour
-- `ponder.config.ts`: chain/contract config, dynamic start block.
-- `ponder.schema.ts`: DB schema for pool creations.
-- `src/index.ts`: event handlers + watchlist seeding.
-- `src/constants.ts`: thresholds, anchors, files, API defaults.
-- `src/env.ts`: layered dotenv loader.
-- `src/monitor.ts`: Dexscreener loop, evaluation, social gate, promising updates.
-- `src/dexscreener.ts`: API client + aggregation + community extraction.
-- `src/utils/watchlist.ts`: JSON-backed watchlist, locking, merging, snapshots, scores.
-- `src/utils/promising.ts`: promising token store with pruning to watchlist.
-- `src/utils/socialProof.ts`: social gate + creator verification + smart follower audit.
-- `src/utils/scoring.ts`: scoring models for Clanker/Zora.
-- `src/utils/smartFollowers.ts`: local smart follower cache loader.
-- `src/utils/address.ts`: normalization helpers.
-- `src/basescan.ts`: BaseScan helpers (owner, supply, balances, LP lock analysis).
-- `src/pipelines/launchpads.ts`: external candidate ingestion + scoring.
-- `src/connectors/*`: Clanker, Zora, Farcaster connectors.
-- `src/api/index.ts`: Hono routes (GraphQL + SQL via Ponder).
-- `scripts/*`: helper CLIs.
-- `data/`: persisted state (created at runtime).
+| Command | Description |
+|---------|-------------|
+| `npm run sniper` | **Real-time sniper bot** - WebSocket event listener |
+| `npm run monitor` | Polling-based monitor (1 min interval) |
+| `npm run dev` | Ponder indexer (development) |
+| `npm run start` | Ponder indexer (production) |
+| `npm run poll:launchpads` | One-off Clanker/Zora fetch |
 
-## Running locally
-1. Install deps: `npm install`
-2. Set env (minimal): `PONDER_RPC_URL_8453`, `TWITTER_API_KEY`, `ZORA_API_KEY`, `CLANKER_API_KEY`, `NEYNAR_API_KEY`, `FARCASTER_API_KEY`, `BASESCAN_API_KEY` (defaults exist but use your own).
-3. Start indexer: `npm run dev` (Ponder UI available).
-4. Run monitor loop (separate process): `npm run monitor`
-5. Optional: `npm run poll:launchpads` to prefill watchlist/promising.
+## Configuration
 
-## Operational notes
-- **Start block** is dynamic: uses latest Base block at boot; if RPC fails, falls back to `FALLBACK_START_BLOCK` (38,050,000). To backfill history, override start blocks or set a static value.
-- **File locks** are ad-hoc promises to serialize writes; corrupted JSON is auto-backed up with a timestamp and recreated.
-- **API quotas**: Dexscreener polling spaced by `DEXSCREENER_REQUEST_DELAY_MS`; BaseScan is throttled to ~4 req/s; external social/creator APIs may need keys/quotas.
-- **LP locks** only computed for V2-style pools with known burn/locker destinations; v3/Slipstream are marked but not quantified.
-- **Smart follower audit** relies on an external script at `../scripts/countSmartFollowers.js` and dataset `../smart_followers_master.json` unless overridden.
+### Required Environment Variables
 
-## Extending
-- Add more factories: extend `ponder.config.ts` + handlers in `src/index.ts`.
-- Adjust health thresholds: tweak `src/constants.ts` or env overrides.
-- Enrich social gate: plug new providers into `src/utils/socialProof.ts`.
-- Add dashboards: consume `data/dex_snapshots.ndjson` and `promising.json`.
+```bash
+# RPC (local full node)
+PONDER_RPC_URL_8453=http://127.0.0.1:18545
+WS_RPC_URL=ws://127.0.0.1:18546
+
+# Telegram Alerts
+TELEGRAM_BOT_TOKEN=your_bot_token
+BASE_DEGEN_ALARM=your_chat_id
+
+# API Keys
+NEYNAR_API_KEY=your_key
+CLANKER_API_KEY=your_key
+ZORA_API_KEY=your_key
+TWITTER_API_KEY=your_key
+```
+
+### Validation Thresholds
+
+```bash
+# Minimum requirements for alerts
+MIN_NEYNAR_SCORE=0.55              # 55% Neynar reputation
+PROMISING_TWITTER_MIN_FOLLOWERS=5000
+PROMISING_FARCASTER_MIN_FOLLOWERS=2000
+```
+
+### Speed Settings
+
+```bash
+# Sniper uses WebSocket (instant)
+# Monitor uses polling:
+POLL_INTERVAL_MS=60000              # 1 minute
+EXTERNAL_REFRESH_INTERVAL_MS=60000  # 1 minute
+DEXSCREENER_REQUEST_DELAY_MS=500    # 500ms between requests
+```
+
+## How It Works
+
+### 1. Sniper Bot (`src/sniper.ts`)
+
+The sniper bot connects directly to your local Base node via WebSocket and subscribes to factory contract events:
+
+```
+Event Detected → Creator Lookup → Neynar Validation → Telegram Alert
+     0ms            ~200ms           ~300ms              ~100ms
+                                                    ─────────────
+                                                    Total: ~600ms
+```
+
+**Flow:**
+1. WebSocket subscription to Clanker/Zora factory addresses
+2. On `TokenCreated` or `CoinCreated` event:
+   - Extract token address and creator
+   - Query Clanker API for creator FID
+   - Check Neynar score (cached 6h)
+   - If passes thresholds → Send Telegram alert
+
+### 2. Monitor (`src/monitor.ts`)
+
+Backup polling-based system that also tracks token health over time:
+
+```
+Poll Clanker/Zora → Add to Watchlist → Check Dexscreener → Evaluate Health
+      ↓                                      ↓
+  Every 1 min                          Liquidity, Volume,
+                                       Buy/Sell ratio
+                                              ↓
+                                    Social Gate Check
+                                              ↓
+                                    Telegram + Promising.json
+```
+
+**Features:**
+- Tracks consecutive healthy cycles
+- Security checks (owner renounced, LP locked)
+- Drops tokens that fail health metrics
+- Maintains historical snapshots
+
+### 3. Telegram Notifications (`src/services/telegram.ts`)
+
+Sends formatted alerts to your Telegram channel:
+
+```
+🚨 NEW PROMISING TOKEN
+
+Token: 0x...
+Symbol: EXAMPLE
+Platform: clanker
+
+📊 Metrics:
+• Liquidity: $50,000
+• Volume 24h: $25,000
+• Buys/Sells 1h: 45/12
+
+👤 Social:
+• Neynar Score: 78%
+• Farcaster: 5,000 followers
+• Creator FID: 12345
+
+🔗 Links:
+DexScreener | Basescan
+```
+
+## Project Structure
+
+```
+ponder-base-createpool2/
+├── src/
+│   ├── sniper.ts           # 🎯 Real-time sniper bot (NEW)
+│   ├── monitor.ts          # Polling-based monitor + Telegram
+│   ├── services/
+│   │   └── telegram.ts     # 📱 Telegram notification service (NEW)
+│   ├── index.ts            # Ponder event handlers
+│   ├── constants.ts        # Thresholds and config
+│   ├── env.ts              # Environment loader
+│   ├── dexscreener.ts      # Dexscreener API client
+│   ├── basescan.ts         # BaseScan API client
+│   ├── connectors/
+│   │   ├── clanker.ts      # Clanker API
+│   │   ├── zora.ts         # Zora API
+│   │   └── farcaster.ts    # Farcaster API
+│   ├── pipelines/
+│   │   └── launchpads.ts   # External source polling
+│   ├── utils/
+│   │   ├── watchlist.ts    # Token watchlist management
+│   │   ├── promising.ts    # Promising tokens store
+│   │   ├── socialProof.ts  # Social validation gates
+│   │   └── scoring.ts      # Token scoring
+│   └── api/
+│       └── index.ts        # GraphQL/SQL API
+├── data/
+│   ├── watchlist.json      # Active token tracking
+│   ├── dex_snapshots.ndjson # Historical metrics
+│   └── promising.json      # Qualified tokens
+├── ponder.config.ts        # Chain/contract config
+└── ponder.schema.ts        # Database schema
+```
+
+## Validation Criteria
+
+A token passes validation if the creator meets:
+
+| Criteria | Threshold | Source |
+|----------|-----------|--------|
+| Neynar Score | ≥ 55% | Neynar API |
+| Farcaster Followers | ≥ 2,000 | Farcaster API |
+| Twitter Followers | ≥ 5,000 | Twitter API |
+
+Health metrics for monitor:
+
+| Metric | Threshold |
+|--------|-----------|
+| Liquidity | ≥ $15,000 |
+| Buys/Hour | ≥ 10 |
+| Buy/Sell Ratio | ≥ 0.65 |
+| Volume 1h | ≥ $10,000 |
+
+## Running with Local Node
+
+For minimum latency, run a local Base node:
+
+```bash
+# Check node sync status
+curl -s -X POST -H "Content-Type: application/json" \
+  --data '{"jsonrpc":"2.0","method":"eth_syncing","params":[],"id":1}' \
+  http://127.0.0.1:18545
+
+# Check current block
+curl -s -X POST -H "Content-Type: application/json" \
+  --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
+  http://127.0.0.1:18545
+```
+
+**RPC Ports:**
+- HTTP: `127.0.0.1:18545`
+- WebSocket: `127.0.0.1:18546`
+
+## Roadmap
+
+- [x] WebSocket event listener
+- [x] Clanker/Zora factory monitoring
+- [x] Neynar score validation
+- [x] Telegram notifications
+- [ ] Auto-buy module
+- [ ] Mempool monitoring (pre-block detection)
+- [ ] Slippage protection
+- [ ] Multi-wallet support
+
+## Latency Comparison
+
+| Method | Detection Time |
+|--------|---------------|
+| Sniper (WebSocket) | **~2-3 seconds** |
+| Monitor (Polling) | ~1-2 minutes |
+| External APIs only | ~5+ minutes |
+
+## Disk Migration Plan (Hetzner +2TB SSD)
+
+When new disk arrives, follow this plan for zero data loss:
+
+### Current Status
+```
+Disk: 7TB (98% full, 185GB free)
+Base Node: 5.2TB (61% synced)
+Needed: +2TB minimum
+```
+
+### Migration Steps
+
+```bash
+# 1. Find new disk (after Hetzner installs it)
+lsblk
+
+# 2. Create partition on NEW disk only
+fdisk /dev/nvme4n1   # or whatever name it gets
+# -> n (new), p (primary), 1, Enter, Enter, w (write)
+
+# 3. Format NEW disk only (existing disks untouched!)
+mkfs.ext4 /dev/nvme4n1p1
+
+# 4. Create mount point
+mkdir -p /mnt/base-data
+
+# 5. Mount new disk
+mount /dev/nvme4n1p1 /mnt/base-data
+
+# 6. Add to fstab (persistent mount)
+echo "/dev/nvme4n1p1 /mnt/base-data ext4 defaults 0 2" >> /etc/fstab
+
+# 7. First rsync - NODE KEEPS RUNNING (takes 4-6 hours)
+rsync -avP /opt/base-node/data/ /mnt/base-data/
+
+# 8. Stop node for final sync (only ~15 min downtime)
+systemctl stop base-reth
+
+# 9. Final rsync - only changes
+rsync -avP --delete /opt/base-node/data/ /mnt/base-data/
+
+# 10. Create symlink
+mv /opt/base-node/data /opt/base-node/data.old
+ln -s /mnt/base-data /opt/base-node/data
+
+# 11. Start node
+systemctl start base-reth
+
+# 12. Verify it works, then delete old data
+# rm -rf /opt/base-node/data.old  # ONLY after confirming!
+```
+
+### Timeline
+| Step | Duration | Node Status |
+|------|----------|-------------|
+| Hetzner installs disk | ~1 hour | ⏸️ Down |
+| Format + Mount | 5 min | ✅ Running |
+| First rsync (background) | 4-6 hours | ✅ Running |
+| Final rsync + symlink | 15-20 min | ⏸️ Down |
+| **Total node downtime** | **~15-20 min** | - |
+
+### Important Notes
+- Existing RAID disks are NOT touched
+- Only the new disk gets formatted
+- Node continues syncing during migration
+- No data loss - node resumes from where it stopped
+
+## License
+
+MIT

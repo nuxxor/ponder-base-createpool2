@@ -2,10 +2,14 @@ import "../env";
 
 import { NewTokenCandidate } from "../types/newToken";
 import { resolveFarcasterIdentity } from "./farcaster";
+import { LRUCache } from "../utils/lruCache";
+import { withRetry } from "../utils/retry";
 
 const CLANKER_API = "https://www.clanker.world/api/tokens";
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
-const launchCountCache = new Map<number, Promise<number | undefined>>();
+
+// LRU cache with max 1000 entries and 1 hour TTL to prevent memory leak
+const launchCountCache = new LRUCache<number, Promise<number | undefined>>(1000, 3600000);
 
 export interface ClankerSocial {
   platform: string;
@@ -50,11 +54,23 @@ export const listClankerTokens = async (
   Object.entries(params).forEach(([key, value]) => {
     url.searchParams.set(key, String(value));
   });
-  const res = await fetch(url);
-  if (!res.ok) {
-    throw new Error(`Clanker HTTP ${res.status}`);
-  }
-  return (await res.json()) as ClankerResponse;
+
+  return withRetry(
+    async () => {
+      const res = await fetch(url);
+      if (!res.ok) {
+        throw new Error(`Clanker HTTP ${res.status}`);
+      }
+      return (await res.json()) as ClankerResponse;
+    },
+    {
+      maxRetries: 3,
+      initialDelayMs: 500,
+      onRetry: (err, attempt) => {
+        console.warn(`[clanker] API retry ${attempt}/3:`, err instanceof Error ? err.message : err);
+      },
+    }
+  );
 };
 
 const normalizeCommunity = (token: ClankerToken) => {
@@ -83,10 +99,12 @@ const normalizeCommunity = (token: ClankerToken) => {
   };
 };
 
-const fetchLaunchCountByFid = async (fid: number) => {
-  if (launchCountCache.has(fid)) {
-    return launchCountCache.get(fid)!;
+const fetchLaunchCountByFid = async (fid: number): Promise<number | undefined> => {
+  const cached = launchCountCache.get(fid);
+  if (cached !== undefined) {
+    return cached;
   }
+
   const task = (async () => {
     try {
       const response = await listClankerTokens({
@@ -101,10 +119,11 @@ const fetchLaunchCountByFid = async (fid: number) => {
       }
       return response.data.length;
     } catch (error) {
-      console.warn(`[clanker] launch count lookup failed for fid ${fid}`, error);
+      console.warn(`[clanker] launch count lookup failed for fid ${fid}`, error instanceof Error ? error.message : error);
       return undefined;
     }
   })();
+
   launchCountCache.set(fid, task);
   return task;
 };

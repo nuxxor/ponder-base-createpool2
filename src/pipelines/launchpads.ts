@@ -5,7 +5,7 @@ import { buildZoraCandidates } from "../connectors/zora";
 import { scoreClanker } from "../utils/scoring";
 
 const EXTERNAL_REFRESH_INTERVAL_MS =
-  Number(process.env.EXTERNAL_REFRESH_INTERVAL_MS) || 5 * 60 * 1000;
+  Number(process.env.EXTERNAL_REFRESH_INTERVAL_MS) || 60 * 1000; // 1 minute for faster detection
 
 let lastRefresh = 0;
 let refreshing = false;

@@ -1,6 +1,8 @@
 import "../env";
 
 import { NEYNAR_SCORE_CACHE_TTL_MS } from "../constants";
+import { LRUCache } from "../utils/lruCache";
+import { withRetry } from "../utils/retry";
 
 const API_BASE =
   (process.env.NEYNAR_API_BASE ?? "https://api.neynar.com").replace(/\/$/, "") +
@@ -12,11 +14,13 @@ type NeynarUser = {
   experimental?: { neynar_user_score?: number };
   fid?: number;
   id?: number;
+  follower_count?: number;
 };
 
-type CacheEntry = { score: number | null; fetchedAt: number };
+type CacheEntry = { score: number | null; followers?: number; fetchedAt: number };
 
-const cache = new Map<number, CacheEntry>();
+// LRU cache with max 2000 entries and configurable TTL
+const cache = new LRUCache<number, CacheEntry>(2000, NEYNAR_SCORE_CACHE_TTL_MS);
 
 const readScore = (user: NeynarUser | undefined): number | null => {
   if (!user) return null;
@@ -35,32 +39,99 @@ export const getNeynarScoreByFid = async (
   if (!API_KEY) {
     throw new Error("NEYNAR_API_KEY is not configured");
   }
-  const now = Date.now();
+
   const cached = cache.get(fid);
-  if (cached && now - cached.fetchedAt < NEYNAR_SCORE_CACHE_TTL_MS) {
+  if (cached) {
     return cached.score;
   }
 
   const url = new URL("v2/farcaster/user/bulk", API_BASE);
   url.searchParams.set("fids", String(fid));
 
-  const res = await fetch(url, {
-    headers: {
-      "x-api-key": API_KEY,
-      Accept: "application/json",
-    },
-  });
+  try {
+    const json = await withRetry(
+      async () => {
+        const res = await fetch(url, {
+          headers: {
+            "x-api-key": API_KEY,
+            Accept: "application/json",
+          },
+        });
 
-  if (!res.ok) {
-    throw new Error(`Neynar HTTP ${res.status}`);
+        if (!res.ok) {
+          throw new Error(`Neynar HTTP ${res.status}`);
+        }
+
+        return (await res.json()) as { users?: NeynarUser[] };
+      },
+      {
+        maxRetries: 3,
+        initialDelayMs: 500,
+        onRetry: (err, attempt) => {
+          console.warn(`[neynar] Score lookup retry ${attempt}/3 for FID ${fid}:`, err instanceof Error ? err.message : err);
+        },
+      }
+    );
+
+    const user = json?.users?.[0];
+    const score = readScore(user);
+    const followers = user?.follower_count;
+
+    cache.set(fid, { score, followers, fetchedAt: Date.now() });
+    return score;
+  } catch (error) {
+    console.error(`[neynar] Failed to fetch score for FID ${fid}:`, error instanceof Error ? error.message : error);
+    return null;
+  }
+};
+
+export const getNeynarUserByFid = async (
+  fid: number,
+): Promise<{ score: number | null; followers?: number } | null> => {
+  if (!API_KEY) {
+    return null;
   }
 
-  const json = (await res.json()) as { users?: NeynarUser[] };
-  const user = json?.users?.[0];
-  const score = readScore(user);
+  const cached = cache.get(fid);
+  if (cached) {
+    return { score: cached.score, followers: cached.followers };
+  }
 
-  cache.set(fid, { score, fetchedAt: now });
-  return score;
+  const url = new URL("v2/farcaster/user/bulk", API_BASE);
+  url.searchParams.set("fids", String(fid));
+
+  try {
+    const json = await withRetry(
+      async () => {
+        const res = await fetch(url, {
+          headers: {
+            "x-api-key": API_KEY,
+            Accept: "application/json",
+          },
+        });
+
+        if (!res.ok) {
+          throw new Error(`Neynar HTTP ${res.status}`);
+        }
+
+        return (await res.json()) as { users?: NeynarUser[] };
+      },
+      {
+        maxRetries: 3,
+        initialDelayMs: 500,
+      }
+    );
+
+    const user = json?.users?.[0];
+    const score = readScore(user);
+    const followers = user?.follower_count;
+
+    cache.set(fid, { score, followers, fetchedAt: Date.now() });
+    return { score, followers };
+  } catch (error) {
+    console.error(`[neynar] Failed to fetch user for FID ${fid}:`, error instanceof Error ? error.message : error);
+    return null;
+  }
 };
 
 const fetchUserByUsername = async (

@@ -27,7 +27,7 @@ export const WATCHLIST_FILE = "watchlist.json";
 export const SNAPSHOT_FILE = "dex_snapshots.ndjson";
 export const PROMISING_TOKENS_FILE = "promising.json";
 
-export const DEFAULT_POLL_INTERVAL_MS = 5 * 60 * 1000;
+export const DEFAULT_POLL_INTERVAL_MS = 60 * 1000; // 1 minute for faster detection
 
 export const MIN_HEALTHY_LIQUIDITY_USD = 15_000;
 export const MIN_BUYS_PER_HOUR = 10;
@@ -48,7 +48,7 @@ export const BASESCAN_API_URL = "https://api.basescan.org/v2/api";
 export const BASESCAN_API_KEY =
   process.env.BASESCAN_API_KEY ?? "UA3SCUYC6D3IVBP9E4613ES89KEQNJR27X";
 export const BASESCAN_MIN_DELAY_MS = 250; // 4 req/s (~5 req/s limit)
-export const MIN_NEYNAR_SCORE = Number(process.env.MIN_NEYNAR_SCORE ?? 0.55);
+export const MIN_NEYNAR_SCORE = Number(process.env.MIN_NEYNAR_SCORE ?? 0.70);
 export const NEYNAR_SCORE_CACHE_TTL_MS = Number(
   process.env.NEYNAR_SCORE_CACHE_TTL_MS ?? 6 * 60 * 60 * 1000,
 ); // default 6h

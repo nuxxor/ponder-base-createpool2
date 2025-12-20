@@ -211,10 +211,56 @@ export const fetchPairsForToken = async (
   return [];
 };
 
+/**
+ * Filter out suspicious/fake pairs
+ * - Zero liquidity pairs
+ * - Pairs with no trading activity
+ * - Pairs created less than 5 minutes ago (bot activity)
+ */
+const filterValidPairs = (pairs: DexPair[]): DexPair[] => {
+  const now = Date.now();
+  const MIN_PAIR_AGE_MS = 5 * 60 * 1000; // 5 minutes
+  const MIN_LIQUIDITY_USD = 100; // At least $100 liquidity
+
+  return pairs.filter((pair) => {
+    // Must have some liquidity
+    const liquidity = parseNumber(pair.liquidity?.usd) ?? 0;
+    if (liquidity < MIN_LIQUIDITY_USD) {
+      return false;
+    }
+
+    // Filter out very new pairs (likely bot activity)
+    if (pair.pairCreatedAt) {
+      const pairAge = now - pair.pairCreatedAt;
+      if (pairAge < MIN_PAIR_AGE_MS) {
+        return false;
+      }
+    }
+
+    // Must have SOME trading activity in 24h (at least 1 transaction)
+    const buysH24 = getTxnCount(pair.txns, "h24", "buys");
+    const sellsH24 = getTxnCount(pair.txns, "h24", "sells");
+    if (buysH24 + sellsH24 === 0) {
+      // Allow pairs without txn data (might just be missing)
+      // but only if they have volume
+      const volumeH24 = getWindowValue(pair.volume ?? {}, "h24");
+      if (volumeH24 === 0) {
+        return false;
+      }
+    }
+
+    return true;
+  });
+};
+
 export const aggregateTokenMetrics = (
   token: string,
   pairs: DexPair[],
 ): TokenMetricsSnapshot => {
+  // Filter out suspicious pairs before aggregating
+  const validPairs = filterValidPairs(pairs);
+  // If all pairs were filtered, fall back to original pairs to avoid missing data
+  const pairsToUse = validPairs.length > 0 ? validPairs : pairs;
   let totalLiquidityUsd = 0;
   let totalVolumeH1 = 0;
   let totalVolumeH24 = 0;
@@ -229,7 +275,7 @@ export const aggregateTokenMetrics = (
   let bestPair: DexPair | undefined;
   let bestPairLiquidity = 0;
 
-  for (const pair of pairs) {
+  for (const pair of pairsToUse) {
     const liquidityUsd = parseNumber(pair.liquidity?.usd) ?? 0;
     totalLiquidityUsd += liquidityUsd;
 

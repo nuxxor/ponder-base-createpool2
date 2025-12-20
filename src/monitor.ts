@@ -37,12 +37,16 @@ import { analyzeLpLockV2, fetchOwnerAddress } from "./basescan";
 import { normalizeAddress } from "./utils/address";
 import { refreshExternalSources } from "./pipelines/launchpads";
 import { enforcePromisingSocialGate } from "./utils/socialProof";
+import { sendTelegramAlert, TokenAlert } from "./services/telegram";
+
+// Sent alerts cache to avoid duplicate notifications
+const sentAlerts = new Set<string>();
 
 const sleep = (ms: number) =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
 const REQUEST_DELAY_MS = Number(
-  process.env.DEXSCREENER_REQUEST_DELAY_MS ?? 1200,
+  process.env.DEXSCREENER_REQUEST_DELAY_MS ?? 500, // Reduced from 1200ms for faster detection
 );
 const RENOUNCED_ADDRESSES = new Set(
   [
@@ -443,6 +447,32 @@ const runCycle = async () => {
 
     if (qualifies) {
       await upsertPromisingToken(entry.token, metrics, evaluation);
+
+      // Send Telegram notification if not already sent
+      if (!sentAlerts.has(entry.token)) {
+        const alert: TokenAlert = {
+          token: entry.token,
+          symbol: entry.tokenMeta?.symbol,
+          name: entry.tokenMeta?.name,
+          platform: entry.identity?.platform,
+          liquidity: metrics.totalLiquidityUsd,
+          volume24h: metrics.totalVolumeH24,
+          buysH1: metrics.totalBuysH1,
+          sellsH1: metrics.totalSellsH1,
+          priceChange: metrics.priceChangeH1,
+          score: evaluation.score,
+          twitterFollowers: entry.identity?.socialStats?.twitter?.followers ?? undefined,
+          farcasterFollowers: entry.identity?.socialStats?.farcaster?.followers ?? undefined,
+          poolAddress: entry.pools[0]?.poolAddress,
+          creatorFid: entry.identity?.creatorFid,
+        };
+
+        const sent = await sendTelegramAlert(alert);
+        if (sent) {
+          sentAlerts.add(entry.token);
+          console.info(`[monitor] Telegram alert sent for ${entry.token}`);
+        }
+      }
     } else {
       await removePromisingToken(entry.token);
       if (socialReasons.length > 0) {
@@ -476,7 +506,7 @@ const main = async () => {
         1,
       )}s. Sleeping ${(waitTime / 1000).toFixed(1)}s.`,
     );
-    await sleep(waitTime || pollInterval);
+    await sleep(waitTime);
   }
 };
 

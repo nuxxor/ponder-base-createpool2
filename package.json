@@ -11,6 +11,7 @@
     "lint": "eslint . --ext .ts,.tsx",
     "typecheck": "tsc",
     "monitor": "tsx src/monitor.ts",
+    "sniper": "tsx src/sniper.ts",
     "poll:launchpads": "tsx src/pipelines/launchpads.ts",
     "test:social-gate": "TMPDIR=./tmp node --import tsx/esm scripts/testSocialGate.ts",
     "test:neynar-score": "node --import tsx/esm scripts/testNeynarScore.ts"
