@@ -11,6 +11,7 @@ import { createPublicClient, webSocket, parseAbiItem, type Log } from "viem";
 import { base } from "viem/chains";
 import { sendTelegramAlert, sendSimpleMessage, TokenAlert } from "./services/telegram";
 import { fetchPairsForToken, aggregateTokenMetrics } from "./dexscreener";
+import { executeBuy, isAutoBuyReady, getWalletInfo, BuyRequest } from "./services/autobuy";
 import * as fs from "fs";
 import * as path from "path";
 
@@ -1095,6 +1096,37 @@ async function sendLiquidityAlert(
   };
 
   await sendTelegramAlert(alert);
+
+  // Execute auto-buy if enabled
+  const autoBuyStatus = isAutoBuyReady();
+  if (autoBuyStatus.ready) {
+    console.log(`[sniper] 🛒 Auto-buy triggered for ${token.symbol || token.address}`);
+
+    const buyRequest: BuyRequest = {
+      tokenAddress: token.address as `0x${string}`,
+      symbol: token.symbol,
+      name: token.name,
+      platform: token.platform,
+      poolAddress: token.poolAddress as `0x${string}` | undefined,
+      liquidity,
+      creatorInfo: {
+        twitterFollowers: creatorInfo.twitterFollowers,
+        farcasterFollowers: creatorInfo.farcasterFollowers,
+        twitterHandle: creatorInfo.twitterHandle,
+      },
+    };
+
+    // Execute buy in background (don't block alert flow)
+    void executeBuy(buyRequest).then((result) => {
+      if (result.success) {
+        console.log(`[sniper] ✅ Auto-buy successful: ${result.txHash}`);
+      } else if (result.skipped) {
+        console.log(`[sniper] ⏭️ Auto-buy skipped: ${result.skipReason}`);
+      } else {
+        console.log(`[sniper] ❌ Auto-buy failed: ${result.error}`);
+      }
+    });
+  }
 }
 
 // Check liquidity for all pending tokens
@@ -1506,11 +1538,31 @@ async function main(): Promise<void> {
   console.log(`[sniper] Min Liquidity: $${MIN_LIQUIDITY_USD.toLocaleString()}`);
   console.log(`[sniper] Watch Time: ${WATCHLIST_MAX_AGE_MS / 60000} minutes`);
   console.log(`[sniper] VIP Content Coins: @base, @jacob, @zora`);
+
+  // Auto-buy status
+  const autoBuyStatus = isAutoBuyReady();
+  if (autoBuyStatus.ready) {
+    const walletInfo = await getWalletInfo();
+    console.log(`[sniper] 🛒 AUTO-BUY: ENABLED`);
+    console.log(`[sniper]    Wallet: ${walletInfo?.address ?? "unknown"}`);
+    console.log(`[sniper]    Balance: ${walletInfo?.balanceEth ?? "0"} ETH`);
+    console.log(`[sniper]    Amount: ${autoBuyStatus.config.amountEth} ETH per trade`);
+    console.log(`[sniper]    Daily Limit: ${autoBuyStatus.config.maxDailyEth} ETH`);
+    console.log(`[sniper]    Slippage: ${autoBuyStatus.config.slippagePercent}%`);
+  } else {
+    console.log(`[sniper] 🛒 AUTO-BUY: DISABLED`);
+    if (!autoBuyStatus.walletConfigured) {
+      console.log(`[sniper]    (Set AUTOBUY_PRIVATE_KEY and AUTOBUY_ENABLED=true to enable)`);
+    }
+  }
   console.log("=".repeat(60));
 
   // Send startup notification
+  const autoBuyMsg = autoBuyStatus.ready
+    ? `\n• Auto-Buy: ENABLED (${autoBuyStatus.config.amountEth} ETH)`
+    : "\n• Auto-Buy: DISABLED";
   void sendSimpleMessage(
-    `🎯 Sniper Bot started\n• Min Liquidity: $${MIN_LIQUIDITY_USD.toLocaleString()}\n• Watch Time: 1 hour`,
+    `🎯 Sniper Bot started\n• Min Liquidity: $${MIN_LIQUIDITY_USD.toLocaleString()}\n• Watch Time: 1 hour${autoBuyMsg}`,
   );
 
   // Create WebSocket client

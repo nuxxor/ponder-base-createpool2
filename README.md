@@ -264,16 +264,76 @@ curl -s -X POST -H "Content-Type: application/json" \
 - HTTP: `127.0.0.1:18545`
 - WebSocket: `127.0.0.1:18546`
 
+## Auto-Buy Module
+
+Automatic token purchases when signals pass validation.
+
+### Configuration
+
+```bash
+# .env.local
+
+# Auto-buy wallet (KEEP SECRET!)
+AUTOBUY_PRIVATE_KEY=0x...your_private_key
+
+# Enable auto-buy
+AUTOBUY_ENABLED=true
+
+# Buy settings
+AUTOBUY_AMOUNT_ETH=0.01          # ETH per trade
+AUTOBUY_MAX_DAILY_ETH=0.5        # Daily spending limit
+AUTOBUY_SLIPPAGE_PERCENT=10      # Slippage tolerance
+AUTOBUY_GAS_PRIORITY_GWEI=0.1    # Priority fee
+
+# Safety
+AUTOBUY_MIN_LIQUIDITY_USD=5000   # Min liquidity before buy
+```
+
+### How It Works
+
+1. Token passes validation (Twitter 70K+ or Farcaster 10K+)
+2. Liquidity check passes ($5K minimum)
+3. Auto-buy executes swap via:
+   - **Clanker**: Uniswap V3 SwapRouter02
+   - **Zora**: Uniswap V4 (with V3 fallback)
+4. Telegram notification sent with trade details
+
+### Trade Flow
+
+```
+Signal Detected → Validation → Liquidity OK? → AUTO-BUY
+                                                 │
+                              ┌──────────────────┴──────────────────┐
+                              ▼                                     ▼
+                       Clanker (V3)                            Zora (V4)
+                              │                                     │
+                              └──────────────────┬──────────────────┘
+                                                 ▼
+                                         WETH → Token Swap
+                                                 │
+                                                 ▼
+                                        Telegram Notification
+```
+
+### Safety Features
+
+- Daily spending limit (default 0.5 ETH)
+- Minimum liquidity check before buy
+- Slippage protection (10% default)
+- Trade logging to `data/trades.jsonl`
+
 ## Roadmap
 
 - [x] WebSocket event listener
 - [x] Clanker/Zora factory monitoring
 - [x] Neynar score validation
 - [x] Telegram notifications
-- [ ] Auto-buy module
+- [x] Auto-buy module (Uniswap V3/V4)
+- [x] Slippage protection
 - [ ] Mempool monitoring (pre-block detection)
-- [ ] Slippage protection
 - [ ] Multi-wallet support
+- [ ] Auto-sell on profit target
+- [ ] Honeypot pre-check
 
 ## Latency Comparison
 
