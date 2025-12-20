@@ -17,9 +17,15 @@ tmp/
 # Ponder
 /generated/
 /.ponder/
+
+# Data directory (large files)
+data/
 /data/
+data/db/
+data/static_files/
 
 # Large data files
 *.ndjson
 *.jsonl
+*.dat
 passed_tokens*.jsonl
