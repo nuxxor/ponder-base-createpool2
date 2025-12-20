@@ -68,8 +68,8 @@ export const formatTokenAlert = (alert: TokenAlert): string => {
   // Helper to escape URL dots for MarkdownV2
   const escapeUrl = (url: string): string => url.replace(/\./g, '\\.');
 
-  // Big account = instant alert (100K+ Twitter, no liquidity check)
-  const isBigAccount = alert.liquidity === 0 && (alert.twitterFollowers ?? 0) >= 100000;
+  // Big account = instant alert (70K+ Twitter, no liquidity check)
+  const isBigAccount = alert.liquidity === 0 && (alert.twitterFollowers ?? 0) >= 70000;
 
   if (isBigAccount) {
     lines.push(`🚀 *BIG ACCOUNT ALERT*`);

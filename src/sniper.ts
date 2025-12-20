@@ -56,7 +56,7 @@ const CLANKER_API_URL = "https://www.clanker.world/api/tokens";
 
 // Minimum thresholds - STRICT MODE
 const MIN_NEYNAR = 0.90; // 90% Neynar score required
-const MIN_TWITTER_FOLLOWERS = 100000; // 100K Twitter followers (for "big account" pass)
+const MIN_TWITTER_FOLLOWERS = 70000; // 70K Twitter followers (for "big account" pass)
 const MIN_TWITTER_MINIMUM = 5000; // 5K Twitter minimum (must have at least this)
 const MIN_FARCASTER_FOLLOWERS = 10000; // 10K Farcaster followers
 
@@ -960,7 +960,7 @@ interface PassedTokenLog {
     twitterHandle?: string;
     twitterFollowers?: number;
   };
-  followerType: "twitter_100k" | "farcaster_40k" | "both";
+  followerType: "twitter_70k" | "farcaster_40k" | "both";
   dexscreenerUrl: string;
 }
 
@@ -990,7 +990,7 @@ async function logPassedToken(
       twitterHandle: creatorInfo.twitterHandle,
       twitterFollowers: creatorInfo.twitterFollowers,
     },
-    followerType: twitterPasses && farcasterPasses ? "both" : twitterPasses ? "twitter_100k" : "farcaster_40k",
+    followerType: twitterPasses && farcasterPasses ? "both" : twitterPasses ? "twitter_70k" : "farcaster_40k",
     dexscreenerUrl: `https://dexscreener.com/base/${token.address}`,
   };
 
