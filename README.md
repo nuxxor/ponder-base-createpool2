@@ -1,13 +1,14 @@
 # Ponder Base Token Sniper
 
-Real-time token sniper bot for Base blockchain. Detects new token launches on Clanker and Zora platforms within seconds, validates creator quality via Neynar score, and sends instant Telegram alerts.
+Real-time token sniper bot for Base blockchain. Detects new token launches on Clanker and Zora platforms within seconds, validates creator quality, and optionally executes automatic purchases.
 
 ## Features
 
 - **Real-time Detection**: WebSocket connection to local Base node for ~0ms latency
 - **Factory Monitoring**: Direct event subscription to Clanker and Zora factories
-- **Creator Validation**: Neynar score and Farcaster follower checks
+- **Creator Validation**: Twitter followers (70K+) and Farcaster followers (10K+) checks
 - **Instant Alerts**: Telegram notifications within 2-3 seconds of token creation
+- **Auto-Buy Module**: Automatic token purchases via Uniswap V3/V4
 - **Backup Monitor**: Polling-based monitor for comprehensive token tracking
 
 ## Architecture
@@ -40,7 +41,7 @@ Real-time token sniper bot for Base blockchain. Detects new token launches on Cl
                               ▼
                  ┌────────────────────────┐
                  │   TELEGRAM ALERT       │
-                 │   + Auto-buy (TODO)    │
+                 │   + Auto-buy (V3/V4)   │
                  └────────────────────────┘
 
                TOTAL: ~2-3 seconds
@@ -321,6 +322,47 @@ Signal Detected → Validation → Liquidity OK? → AUTO-BUY
 - Minimum liquidity check before buy
 - Slippage protection (10% default)
 - Trade logging to `data/trades.jsonl`
+
+### Quick Start (Auto-Buy)
+
+```bash
+# 1. Generate a NEW wallet for trading (don't use main wallet!)
+#    Use MetaMask or any wallet to create a fresh address
+
+# 2. Add private key to .env.local
+echo 'AUTOBUY_PRIVATE_KEY=0x...your_key' >> .env.local
+
+# 3. Fund the wallet with ETH on Base
+#    Send 0.1-0.5 ETH for testing
+
+# 4. Enable auto-buy
+echo 'AUTOBUY_ENABLED=true' >> .env.local
+
+# 5. Start sniper
+npm run sniper
+
+# You should see:
+# [sniper] 🛒 AUTO-BUY: ENABLED
+# [sniper]    Wallet: 0x...
+# [sniper]    Balance: 0.1 ETH
+```
+
+### Telegram Notifications
+
+When auto-buy executes, you'll receive:
+```
+✅ AUTO-BUY EXECUTED
+
+Token: 0x1234...abcd
+Symbol: $EXAMPLE
+Platform: clanker
+
+💰 Trade:
+• Spent: 0.01 ETH
+• Received: 1,234,567 tokens
+
+🔗 Basescan | DexScreener
+```
 
 ## Roadmap
 
