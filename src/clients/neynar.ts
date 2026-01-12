@@ -2,12 +2,15 @@ import "../env";
 
 import { NEYNAR_SCORE_CACHE_TTL_MS } from "../constants";
 import { LRUCache } from "../utils/lruCache";
-import { withRetry } from "../utils/retry";
+import { guardedFetch } from "../utils/http";
 
 const API_BASE =
   (process.env.NEYNAR_API_BASE ?? "https://api.neynar.com").replace(/\/$/, "") +
   "/";
 const API_KEY = process.env.NEYNAR_API_KEY;
+const API_HOST = new URL(API_BASE).host;
+const API_CONCURRENCY = Number(process.env.NEYNAR_CONCURRENCY ?? 4);
+const API_TIMEOUT_MS = Number(process.env.NEYNAR_TIMEOUT_MS ?? 10_000);
 
 type NeynarUser = {
   score?: number;
@@ -49,29 +52,34 @@ export const getNeynarScoreByFid = async (
   url.searchParams.set("fids", String(fid));
 
   try {
-    const json = await withRetry(
-      async () => {
-        const res = await fetch(url, {
-          headers: {
-            "x-api-key": API_KEY,
-            Accept: "application/json",
-          },
-        });
-
-        if (!res.ok) {
-          throw new Error(`Neynar HTTP ${res.status}`);
-        }
-
-        return (await res.json()) as { users?: NeynarUser[] };
+    const res = await guardedFetch(
+      url,
+      {
+        headers: {
+          "x-api-key": API_KEY,
+          Accept: "application/json",
+        },
       },
       {
+        hostKey: API_HOST,
+        concurrency: API_CONCURRENCY,
+        timeoutMs: API_TIMEOUT_MS,
         maxRetries: 3,
         initialDelayMs: 500,
         onRetry: (err, attempt) => {
-          console.warn(`[neynar] Score lookup retry ${attempt}/3 for FID ${fid}:`, err instanceof Error ? err.message : err);
+          console.warn(
+            `[neynar] Score lookup retry ${attempt}/3 for FID ${fid}:`,
+            err instanceof Error ? err.message : err,
+          );
         },
-      }
+      },
     );
+
+    if (!res.ok) {
+      throw new Error(`Neynar HTTP ${res.status}`);
+    }
+
+    const json = (await res.json()) as { users?: NeynarUser[] };
 
     const user = json?.users?.[0];
     const score = readScore(user);
@@ -101,26 +109,28 @@ export const getNeynarUserByFid = async (
   url.searchParams.set("fids", String(fid));
 
   try {
-    const json = await withRetry(
-      async () => {
-        const res = await fetch(url, {
-          headers: {
-            "x-api-key": API_KEY,
-            Accept: "application/json",
-          },
-        });
-
-        if (!res.ok) {
-          throw new Error(`Neynar HTTP ${res.status}`);
-        }
-
-        return (await res.json()) as { users?: NeynarUser[] };
+    const res = await guardedFetch(
+      url,
+      {
+        headers: {
+          "x-api-key": API_KEY,
+          Accept: "application/json",
+        },
       },
       {
+        hostKey: API_HOST,
+        concurrency: API_CONCURRENCY,
+        timeoutMs: API_TIMEOUT_MS,
         maxRetries: 3,
         initialDelayMs: 500,
-      }
+      },
     );
+
+    if (!res.ok) {
+      throw new Error(`Neynar HTTP ${res.status}`);
+    }
+
+    const json = (await res.json()) as { users?: NeynarUser[] };
 
     const user = json?.users?.[0];
     const score = readScore(user);
@@ -150,9 +160,19 @@ const fetchUserByUsername = async (
 
   for (const path of variants) {
     const url = new URL(path, API_BASE);
-    const res = await fetch(url, {
-      headers: { "x-api-key": API_KEY, Accept: "application/json" },
-    });
+    const res = await guardedFetch(
+      url,
+      {
+        headers: { "x-api-key": API_KEY, Accept: "application/json" },
+      },
+      {
+        hostKey: API_HOST,
+        concurrency: API_CONCURRENCY,
+        timeoutMs: API_TIMEOUT_MS,
+        maxRetries: 2,
+        initialDelayMs: 500,
+      },
+    );
     if (!res.ok) {
       continue;
     }
@@ -184,9 +204,19 @@ const searchUser = async (
   url.searchParams.set("q", sanitized);
   url.searchParams.set("limit", "25");
 
-  const res = await fetch(url, {
-    headers: { "x-api-key": API_KEY, Accept: "application/json" },
-  });
+  const res = await guardedFetch(
+    url,
+    {
+      headers: { "x-api-key": API_KEY, Accept: "application/json" },
+    },
+    {
+      hostKey: API_HOST,
+      concurrency: API_CONCURRENCY,
+      timeoutMs: API_TIMEOUT_MS,
+      maxRetries: 2,
+      initialDelayMs: 500,
+    },
+  );
 
   if (!res.ok) {
     return null;

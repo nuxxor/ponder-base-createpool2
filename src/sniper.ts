@@ -12,6 +12,7 @@ import { base } from "viem/chains";
 import { sendTelegramAlert, sendSimpleMessage, TokenAlert } from "./services/telegram";
 import { fetchPairsForToken, aggregateTokenMetrics } from "./dexscreener";
 import { executeBuy, isAutoBuyReady, getWalletInfo, BuyRequest } from "./services/autobuy";
+import { LRUCache } from "./utils/lruCache";
 import * as fs from "fs";
 import * as path from "path";
 
@@ -74,6 +75,115 @@ const SNIPER_EVENT_CONCURRENCY = Math.max(
 const WATCHLIST_DEX_CONCURRENCY = Math.max(
   1,
   Number(process.env.SNIPER_WATCHLIST_CONCURRENCY ?? 4),
+);
+
+// Guardrails: cursor persistence + event dedup
+const SNIPER_DATA_DIR = path.resolve(process.cwd(), process.env.SNIPER_DATA_DIR ?? "data");
+const SNIPER_CURSOR_PATH = path.join(
+  SNIPER_DATA_DIR,
+  process.env.SNIPER_CURSOR_FILE ?? "sniper_cursor.json",
+);
+const SNIPER_CURSOR_FLUSH_MS = Number(
+  process.env.SNIPER_CURSOR_FLUSH_MS ?? 5000,
+);
+const SNIPER_ENABLE_BACKFILL =
+  String(process.env.SNIPER_ENABLE_BACKFILL ?? "true").toLowerCase() ===
+  "true";
+const SNIPER_BACKFILL_BLOCKS = BigInt(
+  Math.max(0, Number(process.env.SNIPER_BACKFILL_BLOCKS ?? 50)),
+);
+const SNIPER_BACKFILL_MAX_LOGS = Math.max(
+  0,
+  Number(process.env.SNIPER_BACKFILL_MAX_LOGS ?? 200),
+);
+const SNIPER_DEDUP_TTL_MS = Number(
+  process.env.SNIPER_DEDUP_TTL_MS ?? 30 * 60 * 1000,
+);
+
+type SniperCursorState = {
+  lastSeenBlock?: string;
+  updatedAt?: string;
+};
+
+let sniperLastSeenBlock: bigint | null = null;
+let sniperCursorDirty = false;
+
+const ensureSniperDataDir = async () => {
+  await fs.promises.mkdir(SNIPER_DATA_DIR, { recursive: true });
+};
+
+const readSniperCursor = async (): Promise<bigint | null> => {
+  try {
+    const raw = await fs.promises.readFile(SNIPER_CURSOR_PATH, "utf8");
+    const parsed = JSON.parse(raw) as SniperCursorState;
+    const value = parsed.lastSeenBlock;
+    if (!value) return null;
+    const block = BigInt(value);
+    return block >= 0n ? block : null;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return null;
+    }
+    console.warn(
+      "[sniper] Failed to read cursor file, starting without backfill:",
+      error instanceof Error ? error.message : error,
+    );
+    return null;
+  }
+};
+
+const writeSniperCursor = async (block: bigint) => {
+  await ensureSniperDataDir();
+  const payload: SniperCursorState = {
+    lastSeenBlock: block.toString(),
+    updatedAt: new Date().toISOString(),
+  };
+  const tmpPath = `${SNIPER_CURSOR_PATH}.${Date.now()}.${Math.random()
+    .toString(16)
+    .slice(2)}.tmp`;
+  await fs.promises.writeFile(
+    tmpPath,
+    JSON.stringify(payload, null, 2) + "\n",
+    "utf8",
+  );
+  await fs.promises.rename(tmpPath, SNIPER_CURSOR_PATH);
+};
+
+const markSniperCursor = (block: bigint | undefined | null) => {
+  if (!block) return;
+  if (sniperLastSeenBlock === null || block > sniperLastSeenBlock) {
+    sniperLastSeenBlock = block;
+    sniperCursorDirty = true;
+  }
+};
+
+const flushSniperCursor = async () => {
+  if (!sniperCursorDirty) return;
+  if (sniperLastSeenBlock === null) return;
+  sniperCursorDirty = false;
+  try {
+    await writeSniperCursor(sniperLastSeenBlock);
+  } catch (error) {
+    sniperCursorDirty = true;
+    console.warn(
+      "[sniper] Failed to write cursor file:",
+      error instanceof Error ? error.message : error,
+    );
+  }
+};
+
+const getEventId = (log: Log): string => {
+  const anyLog = log as any;
+  const txHash = String(log.transactionHash ?? anyLog.transactionHash ?? "unknown");
+  const logIndex =
+    anyLog.logIndex ?? anyLog.index ?? anyLog.log?.logIndex ?? "unknown";
+  const address = String(log.address ?? anyLog.address ?? "").toLowerCase();
+  return `${txHash}:${String(logIndex)}:${address}`;
+};
+
+const processedEventIds = new LRUCache<string, true>(
+  50_000,
+  SNIPER_DEDUP_TTL_MS,
 );
 
 // API Health tracking
@@ -153,6 +263,155 @@ const createConcurrencyLimiter = (concurrency: number) => {
       next();
     }
   };
+};
+
+const compareLogsByOrder = (a: any, b: any) => {
+  const aBlock = (a?.blockNumber ?? 0n) as bigint;
+  const bBlock = (b?.blockNumber ?? 0n) as bigint;
+  if (aBlock === bBlock) {
+    const aIndexRaw = a?.logIndex ?? a?.index ?? 0;
+    const bIndexRaw = b?.logIndex ?? b?.index ?? 0;
+    const aIndex = BigInt(aIndexRaw);
+    const bIndex = BigInt(bIndexRaw);
+    if (aIndex === bIndex) return 0;
+    return aIndex < bIndex ? -1 : 1;
+  }
+  return aBlock < bBlock ? -1 : 1;
+};
+
+const backfillRecentEvents = async (
+  client: any,
+  runEventTask: ReturnType<typeof createConcurrencyLimiter>,
+) => {
+  if (!SNIPER_ENABLE_BACKFILL) {
+    return;
+  }
+
+  if (sniperLastSeenBlock === null) {
+    return;
+  }
+
+  let currentBlock: bigint;
+  try {
+    currentBlock = await client.getBlockNumber();
+  } catch (error) {
+    console.warn(
+      "[sniper] Backfill skipped (could not get current block):",
+      error instanceof Error ? error.message : error,
+    );
+    return;
+  }
+
+  const cursor = sniperLastSeenBlock;
+  const fromBlock = cursor > SNIPER_BACKFILL_BLOCKS ? cursor - SNIPER_BACKFILL_BLOCKS : 0n;
+  const toBlock = currentBlock;
+
+  if (fromBlock >= toBlock) {
+    return;
+  }
+
+  console.log(
+    `[sniper] 🔎 Backfill: blocks ${fromBlock}..${toBlock} (cursor=${cursor}, maxLogs=${SNIPER_BACKFILL_MAX_LOGS})`,
+  );
+
+  const results = await Promise.allSettled([
+    client.getLogs({
+      address: CLANKER_FACTORY as `0x${string}`,
+      event: CLANKER_TOKEN_CREATED,
+      fromBlock,
+      toBlock,
+    }),
+    client.getLogs({
+      address: ZORA_FACTORY as `0x${string}`,
+      event: ZORA_COIN_CREATED,
+      fromBlock,
+      toBlock,
+    }),
+    client.getLogs({
+      address: ZORA_FACTORY as `0x${string}`,
+      event: ZORA_CREATOR_COIN_CREATED,
+      fromBlock,
+      toBlock,
+    }),
+    client.getLogs({
+      address: ZORA_FACTORY as `0x${string}`,
+      event: ZORA_CREATOR_COIN_CREATED_V2,
+      fromBlock,
+      toBlock,
+    }),
+    client.getLogs({
+      address: ZORA_FACTORY as `0x${string}`,
+      event: ZORA_COIN_CREATED_V4,
+      fromBlock,
+      toBlock,
+    }),
+  ]);
+
+  const logs: Log[] = [];
+  const labels = [
+    "clanker:TokenCreated",
+    "zora:CoinCreated(legacy)",
+    "zora:CreatorCoinCreated(v1)",
+    "zora:CreatorCoinCreated(v2)",
+    "zora:CoinCreatedV4(vip)",
+  ];
+
+  results.forEach((result, idx) => {
+    if (result.status === "fulfilled") {
+      logs.push(...(result.value as Log[]));
+      return;
+    }
+    console.warn(
+      `[sniper] Backfill getLogs failed (${labels[idx] ?? "unknown"}):`,
+      result.reason instanceof Error ? result.reason.message : result.reason,
+    );
+  });
+
+  if (logs.length === 0) {
+    console.log("[sniper] 🔎 Backfill: no logs found");
+    return;
+  }
+
+  logs.sort(compareLogsByOrder);
+
+  const toProcess =
+    SNIPER_BACKFILL_MAX_LOGS > 0 && logs.length > SNIPER_BACKFILL_MAX_LOGS
+      ? logs.slice(-SNIPER_BACKFILL_MAX_LOGS)
+      : logs;
+
+  console.log(
+    `[sniper] 🔎 Backfill: collected ${logs.length} logs, scheduling ${toProcess.length}`,
+  );
+
+  for (const log of toProcess) {
+    const eventId = getEventId(log);
+    if (processedEventIds.has(eventId)) {
+      continue;
+    }
+
+    processedEventIds.set(eventId, true);
+    markSniperCursor(log.blockNumber);
+
+    void runEventTask(async () => {
+      try {
+        const address = String(log.address ?? "").toLowerCase();
+        if (address === CLANKER_FACTORY.toLowerCase()) {
+          await handleClankerEvent(log);
+          return;
+        }
+        if (address === ZORA_FACTORY.toLowerCase()) {
+          await handleZoraEvent(log);
+          await handleZoraVIPEvent(log);
+        }
+      } catch (error) {
+        processedEventIds.delete(eventId);
+        console.error(
+          "[sniper] Backfill handler error:",
+          error instanceof Error ? error.message : error,
+        );
+      }
+    });
+  }
 };
 
 // Pending tokens watchlist - tokens waiting for liquidity
@@ -1578,13 +1837,29 @@ async function main(): Promise<void> {
   console.log("[sniper] Connecting to WebSocket...");
 
   // Test connection
+  let connectedBlock = BigInt(0);
   try {
-    const blockNumber = await client.getBlockNumber();
-    console.log(`[sniper] ✅ Connected! Current block: ${blockNumber}`);
+    connectedBlock = await client.getBlockNumber();
+    console.log(`[sniper] ✅ Connected! Current block: ${connectedBlock}`);
   } catch (error) {
     console.error("[sniper] ❌ Failed to connect to WebSocket:", error);
     process.exit(1);
   }
+
+  // Load or initialize cursor so restarts can backfill missed logs.
+  sniperLastSeenBlock = await readSniperCursor();
+  if (sniperLastSeenBlock === null) {
+    sniperLastSeenBlock = connectedBlock;
+    sniperCursorDirty = true;
+    console.log(`[sniper] Cursor initialized at block ${sniperLastSeenBlock}`);
+  } else {
+    console.log(`[sniper] Cursor loaded: ${sniperLastSeenBlock}`);
+  }
+
+  const cursorInterval = setInterval(() => {
+    void flushSniperCursor();
+  }, SNIPER_CURSOR_FLUSH_MS);
+  cursorInterval.unref?.();
 
   // Track connection health
   let lastBlockSeen = BigInt(0);
@@ -1599,6 +1874,16 @@ async function main(): Promise<void> {
   let unwatchVIP: (() => void) | null = null;
 
   const runEventTask = createConcurrencyLimiter(SNIPER_EVENT_CONCURRENCY);
+
+  // Opportunistic backfill: fetch recent logs around the persisted cursor.
+  try {
+    await backfillRecentEvents(client, runEventTask);
+  } catch (error) {
+    console.warn(
+      "[sniper] Backfill failed (continuing):",
+      error instanceof Error ? error.message : error,
+    );
+  }
 
   // Circuit breaker resubscribe function
   async function resubscribeAll() {
@@ -1646,6 +1931,13 @@ async function main(): Promise<void> {
         consecutiveErrors = 0;
         lastEventAt = Date.now();
         for (const log of logs) {
+          const eventId = getEventId(log);
+          if (processedEventIds.has(eventId)) {
+            continue;
+          }
+          processedEventIds.set(eventId, true);
+          markSniperCursor(log.blockNumber);
+
           if (log.blockNumber && log.blockNumber > lastBlockSeen) {
             lastBlockSeen = log.blockNumber;
           }
@@ -1653,6 +1945,7 @@ async function main(): Promise<void> {
             try {
               await handleClankerEvent(log);
             } catch (error) {
+              processedEventIds.delete(eventId);
               console.error(`[sniper] Error handling Clanker event:`, error);
             }
           });
@@ -1677,6 +1970,13 @@ async function main(): Promise<void> {
         consecutiveErrors = 0;
         lastEventAt = Date.now();
         for (const log of logs) {
+          const eventId = getEventId(log);
+          if (processedEventIds.has(eventId)) {
+            continue;
+          }
+          processedEventIds.set(eventId, true);
+          markSniperCursor(log.blockNumber);
+
           if (log.blockNumber && log.blockNumber > lastBlockSeen) {
             lastBlockSeen = log.blockNumber;
           }
@@ -1684,6 +1984,7 @@ async function main(): Promise<void> {
             try {
               await handleZoraEvent(log);
             } catch (error) {
+              processedEventIds.delete(eventId);
               console.error(`[sniper] Error handling Zora event:`, error);
             }
           });
@@ -1708,6 +2009,13 @@ async function main(): Promise<void> {
         consecutiveErrors = 0;
         lastEventAt = Date.now();
         for (const log of logs) {
+          const eventId = getEventId(log);
+          if (processedEventIds.has(eventId)) {
+            continue;
+          }
+          processedEventIds.set(eventId, true);
+          markSniperCursor(log.blockNumber);
+
           if (log.blockNumber && log.blockNumber > lastBlockSeen) {
             lastBlockSeen = log.blockNumber;
           }
@@ -1715,6 +2023,7 @@ async function main(): Promise<void> {
             try {
               await handleZoraVIPEvent(log);
             } catch (error) {
+              processedEventIds.delete(eventId);
               console.error(`[sniper] Error handling Zora VIP event:`, error);
             }
           });
@@ -1737,6 +2046,21 @@ async function main(): Promise<void> {
   // Start watchlist liquidity monitoring
   startWatchlistLoop();
 
+  // Periodic pruning for long-running process hygiene
+  const pruneInterval = setInterval(() => {
+    const now = Date.now();
+    for (const [key, data] of creatorTokenCount.entries()) {
+      if (now - data.firstSeen > CREATOR_WINDOW_MS) {
+        creatorTokenCount.delete(key);
+      }
+    }
+    const pruned = processedEventIds.prune();
+    if (pruned > 0) {
+      console.log(`[sniper] 🧹 Pruned ${pruned} dedup entries`);
+    }
+  }, Number(process.env.SNIPER_PRUNE_INTERVAL_MS ?? 60 * 60 * 1000));
+  pruneInterval.unref?.();
+
   // Keep alive
   process.on("SIGINT", async () => {
     console.log("\n[sniper] Shutting down...");
@@ -1744,6 +2068,7 @@ async function main(): Promise<void> {
     if (unwatchClanker) unwatchClanker();
     if (unwatchZora) unwatchZora();
     if (unwatchVIP) unwatchVIP();
+    await flushSniperCursor();
     process.exit(0);
   });
 
@@ -1797,5 +2122,6 @@ async function main(): Promise<void> {
 main().catch(async (error) => {
   console.error("[sniper] Fatal error:", error);
   await sendSimpleMessage(`❌ Sniper Bot crashed: ${error instanceof Error ? error.message : "Unknown error"}`);
+  await flushSniperCursor();
   process.exit(1);
 });

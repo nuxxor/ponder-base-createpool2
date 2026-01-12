@@ -5,6 +5,7 @@ import {
   LOCK_DESTINATIONS,
 } from "./constants";
 import { normalizeAddress } from "./utils/address";
+import { guardedFetch } from "./utils/http";
 
 type BaseScanResponse<T> = {
   status?: string;
@@ -30,7 +31,13 @@ const callBaseScan = async <T>(params: Record<string, string>): Promise<T> => {
     url.searchParams.set(key, value);
   }
 
-  const res = await fetch(url);
+  const res = await guardedFetch(url, undefined, {
+    hostKey: "api.basescan.org",
+    concurrency: 1,
+    maxRetries: 2,
+    initialDelayMs: 500,
+    timeoutMs: Number(process.env.BASESCAN_TIMEOUT_MS ?? 10_000),
+  });
   lastCallAt = Date.now();
   if (!res.ok) {
     throw new Error(`BaseScan HTTP ${res.status}`);

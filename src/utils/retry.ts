@@ -8,11 +8,14 @@ export interface RetryOptions {
   initialDelayMs?: number;
   maxDelayMs?: number;
   backoffMultiplier?: number;
+  timeoutMs?: number;
   shouldRetry?: (error: unknown) => boolean;
   onRetry?: (error: unknown, attempt: number, delayMs: number) => void;
 }
 
-const DEFAULT_OPTIONS: Required<Omit<RetryOptions, "shouldRetry" | "onRetry">> = {
+const DEFAULT_OPTIONS: Required<
+  Omit<RetryOptions, "shouldRetry" | "onRetry" | "timeoutMs">
+> = {
   maxRetries: 3,
   initialDelayMs: 500,
   maxDelayMs: 10000,
@@ -95,23 +98,60 @@ export async function fetchWithRetry(
   init?: RequestInit,
   options: RetryOptions = {}
 ): Promise<Response> {
+  const timeoutMs = options.timeoutMs;
   const shouldRetry = options.shouldRetry ?? ((error: unknown) => {
     // Retry on network errors
     if (error instanceof TypeError) return true;
+    // Retry on timeouts/aborts (Node fetch throws AbortError)
+    if (
+      (error instanceof Error && error.name === "AbortError") ||
+      (typeof (error as any)?.name === "string" &&
+        (error as any).name === "AbortError")
+    ) {
+      return true;
+    }
     // Don't retry on other errors by default
     return false;
   });
 
   return withRetry(
     async () => {
-      const response = await fetch(url, init);
+      const controller =
+        timeoutMs || init?.signal ? new AbortController() : undefined;
+      let timeout: ReturnType<typeof setTimeout> | undefined;
 
-      // Retry on server errors (5xx) and rate limits (429)
-      if (response.status >= 500 || response.status === 429) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      if (controller && init?.signal) {
+        const parentSignal = init.signal;
+        if (parentSignal.aborted) {
+          controller.abort(parentSignal.reason);
+        } else {
+          parentSignal.addEventListener(
+            "abort",
+            () => controller.abort(parentSignal.reason),
+            { once: true },
+          );
+        }
       }
 
-      return response;
+      if (controller && timeoutMs) {
+        timeout = setTimeout(() => controller.abort(), timeoutMs);
+      }
+
+      try {
+        const response = await fetch(url, {
+          ...init,
+          signal: controller?.signal ?? init?.signal,
+        });
+
+        // Retry on server errors (5xx) and rate limits (429)
+        if (response.status >= 500 || response.status === 429) {
+          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+
+        return response;
+      } finally {
+        if (timeout) clearTimeout(timeout);
+      }
     },
     { ...options, shouldRetry }
   );

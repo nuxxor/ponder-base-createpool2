@@ -26,6 +26,7 @@ const getConfig = () => ({
 
 // Trade history file
 const TRADES_LOG_FILE = path.join(process.cwd(), "data", "trades.jsonl");
+const DAILY_STATS_FILE = path.join(process.cwd(), "data", "autobuy_daily.json");
 
 // Daily tracking
 interface DailyStats {
@@ -36,26 +37,99 @@ interface DailyStats {
   failCount: number;
 }
 
-let dailyStats: DailyStats = {
-  date: new Date().toISOString().split("T")[0] ?? "",
+const getToday = () => new Date().toISOString().split("T")[0] ?? "";
+
+const createEmptyDailyStats = (date = getToday()): DailyStats => ({
+  date,
   totalSpentEth: 0,
   tradeCount: 0,
   successCount: 0,
   failCount: 0,
+});
+
+let dailyStats: DailyStats = createEmptyDailyStats();
+let dailyStatsDirty = false;
+let dailyStatsInit: Promise<void> | null = null;
+let dailyStatsWriteQueue: Promise<void> = Promise.resolve();
+
+const enqueueDailyStatsWrite = async (task: () => Promise<void>) => {
+  dailyStatsWriteQueue = dailyStatsWriteQueue.then(task, task);
+  await dailyStatsWriteQueue;
+};
+
+const flushDailyStats = async () => {
+  if (!dailyStatsDirty) return;
+  dailyStatsDirty = false;
+
+  try {
+    const dataDir = path.dirname(DAILY_STATS_FILE);
+    await fs.promises.mkdir(dataDir, { recursive: true });
+
+    const tmpPath = `${DAILY_STATS_FILE}.${Date.now()}.${Math.random()
+      .toString(16)
+      .slice(2)}.tmp`;
+    await enqueueDailyStatsWrite(async () => {
+      await fs.promises.writeFile(
+        tmpPath,
+        JSON.stringify(dailyStats, null, 2) + "\n",
+        "utf8",
+      );
+      await fs.promises.rename(tmpPath, DAILY_STATS_FILE);
+    });
+  } catch (error) {
+    dailyStatsDirty = true;
+    console.warn(
+      "[autobuy] Failed to persist daily stats:",
+      error instanceof Error ? error.message : error,
+    );
+  }
+};
+
+const initDailyStats = async () => {
+  if (dailyStatsInit) return dailyStatsInit;
+
+  dailyStatsInit = (async () => {
+    try {
+      const raw = await fs.promises.readFile(DAILY_STATS_FILE, "utf8");
+      const parsed = JSON.parse(raw) as Partial<DailyStats>;
+      if (
+        typeof parsed?.date === "string" &&
+        typeof parsed?.totalSpentEth === "number" &&
+        typeof parsed?.tradeCount === "number" &&
+        typeof parsed?.successCount === "number" &&
+        typeof parsed?.failCount === "number"
+      ) {
+        dailyStats = {
+          date: parsed.date,
+          totalSpentEth: parsed.totalSpentEth,
+          tradeCount: parsed.tradeCount,
+          successCount: parsed.successCount,
+          failCount: parsed.failCount,
+        };
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        console.warn(
+          "[autobuy] Failed to load daily stats (starting fresh):",
+          error instanceof Error ? error.message : error,
+        );
+      }
+    }
+
+    checkDailyReset();
+    await flushDailyStats();
+  })();
+
+  return dailyStatsInit;
 };
 
 // Reset daily stats if new day
 function checkDailyReset(): void {
-  const today = new Date().toISOString().split("T")[0] ?? "";
+  const today = getToday();
   if (dailyStats.date !== today) {
     console.log(`[autobuy] New day detected, resetting daily stats`);
-    dailyStats = {
-      date: today,
-      totalSpentEth: 0,
-      tradeCount: 0,
-      successCount: 0,
-      failCount: 0,
-    };
+    dailyStats = createEmptyDailyStats(today);
+    dailyStatsDirty = true;
   }
 }
 
@@ -101,9 +175,14 @@ async function logTrade(
       txHash: result.txHash!,
       amountInEth: amountEth.toString(),
       amountOutTokens: result.amountOut?.toString() || "unknown",
-      pricePerToken: result.amountOut
-        ? (amountEth / Number(result.amountOut)).toExponential(4)
-        : "unknown",
+      pricePerToken: (() => {
+        if (!result.amountOut || result.amountOut <= 0n) return "unknown";
+        const amountOutNumber = Number(result.amountOut);
+        if (!Number.isFinite(amountOutNumber) || amountOutNumber <= 0) {
+          return "unknown";
+        }
+        return (amountEth / amountOutNumber).toExponential(4);
+      })(),
       status: result.success ? "success" : "failed",
     };
 
@@ -212,10 +291,25 @@ function shouldProceed(request: BuyRequest): { proceed: boolean; reason?: string
   return { proceed: true };
 }
 
+// Serialize auto-buy execution to avoid race conditions on daily limits and balances.
+let buyQueue: Promise<void> = Promise.resolve();
+const enqueueBuy = async <T>(task: () => Promise<T>): Promise<T> => {
+  const result = buyQueue.then(task, task);
+  buyQueue = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+};
+
 /**
  * Execute auto-buy for a token
  */
-export async function executeBuy(request: BuyRequest): Promise<BuyResult> {
+async function executeBuyInner(request: BuyRequest): Promise<BuyResult> {
+  await initDailyStats();
+  checkDailyReset();
+  await flushDailyStats();
+
   const config = getConfig();
   const startTime = Date.now();
 
@@ -225,6 +319,7 @@ export async function executeBuy(request: BuyRequest): Promise<BuyResult> {
   const { proceed, reason } = shouldProceed(request);
   if (!proceed) {
     console.log(`[autobuy] Skipped: ${reason}`);
+    await flushDailyStats();
     return { success: false, skipped: true, skipReason: reason };
   }
 
@@ -251,6 +346,8 @@ export async function executeBuy(request: BuyRequest): Promise<BuyResult> {
 
   // Update stats
   dailyStats.tradeCount++;
+  dailyStatsDirty = true;
+  await flushDailyStats();
 
   // Execute swap based on platform
   let swapResult: SwapResult;
@@ -278,6 +375,8 @@ export async function executeBuy(request: BuyRequest): Promise<BuyResult> {
     console.error(`[autobuy] Swap error:`, errorMsg);
 
     dailyStats.failCount++;
+    dailyStatsDirty = true;
+    await flushDailyStats();
     const result: BuyResult = { success: false, error: errorMsg };
     await notifyTrade(request, result, config.amountEth);
     return result;
@@ -289,6 +388,8 @@ export async function executeBuy(request: BuyRequest): Promise<BuyResult> {
   if (swapResult.success) {
     dailyStats.successCount++;
     dailyStats.totalSpentEth += config.amountEth;
+    dailyStatsDirty = true;
+    await flushDailyStats();
 
     console.log(`[autobuy] ✅ Buy successful in ${elapsed}ms: ${swapResult.txHash}`);
 
@@ -308,6 +409,8 @@ export async function executeBuy(request: BuyRequest): Promise<BuyResult> {
     return result;
   } else {
     dailyStats.failCount++;
+    dailyStatsDirty = true;
+    await flushDailyStats();
 
     console.log(`[autobuy] ❌ Buy failed in ${elapsed}ms: ${swapResult.error}`);
 
@@ -320,6 +423,10 @@ export async function executeBuy(request: BuyRequest): Promise<BuyResult> {
 
     return result;
   }
+}
+
+export async function executeBuy(request: BuyRequest): Promise<BuyResult> {
+  return enqueueBuy(() => executeBuyInner(request));
 }
 
 /**

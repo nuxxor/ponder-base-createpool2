@@ -3,7 +3,7 @@ import "../env";
 import { NewTokenCandidate } from "../types/newToken";
 import { resolveFarcasterIdentity } from "./farcaster";
 import { LRUCache } from "../utils/lruCache";
-import { withRetry } from "../utils/retry";
+import { guardedFetch } from "../utils/http";
 
 const CLANKER_API = "https://www.clanker.world/api/tokens";
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
@@ -55,22 +55,23 @@ export const listClankerTokens = async (
     url.searchParams.set(key, String(value));
   });
 
-  return withRetry(
-    async () => {
-      const res = await fetch(url);
-      if (!res.ok) {
-        throw new Error(`Clanker HTTP ${res.status}`);
-      }
-      return (await res.json()) as ClankerResponse;
+  const res = await guardedFetch(url, undefined, {
+    hostKey: new URL(CLANKER_API).host,
+    concurrency: Number(process.env.CLANKER_CONCURRENCY ?? 4),
+    timeoutMs: Number(process.env.CLANKER_TIMEOUT_MS ?? 10_000),
+    maxRetries: 3,
+    initialDelayMs: 500,
+    onRetry: (err, attempt) => {
+      console.warn(
+        `[clanker] API retry ${attempt}/3:`,
+        err instanceof Error ? err.message : err,
+      );
     },
-    {
-      maxRetries: 3,
-      initialDelayMs: 500,
-      onRetry: (err, attempt) => {
-        console.warn(`[clanker] API retry ${attempt}/3:`, err instanceof Error ? err.message : err);
-      },
-    }
-  );
+  });
+  if (!res.ok) {
+    throw new Error(`Clanker HTTP ${res.status}`);
+  }
+  return (await res.json()) as ClankerResponse;
 };
 
 const normalizeCommunity = (token: ClankerToken) => {

@@ -39,8 +39,31 @@ import { refreshExternalSources } from "./pipelines/launchpads";
 import { enforcePromisingSocialGate } from "./utils/socialProof";
 import { sendTelegramAlert, TokenAlert } from "./services/telegram";
 
-// Sent alerts cache to avoid duplicate notifications
-const sentAlerts = new Set<string>();
+// Sent alerts cache to avoid duplicate notifications (bounded via TTL)
+const SENT_ALERT_TTL_MS = Number(
+  process.env.SENT_ALERT_TTL_MS ?? 7 * 24 * 60 * 60 * 1000,
+);
+const sentAlerts = new Map<string, number>();
+
+const hasRecentlySentAlert = (token: string) => {
+  const sentAt = sentAlerts.get(token);
+  if (!sentAt) return false;
+  return Date.now() - sentAt <= SENT_ALERT_TTL_MS;
+};
+
+const markSentAlert = (token: string) => {
+  sentAlerts.set(token, Date.now());
+};
+
+const pruneSentAlerts = () => {
+  if (sentAlerts.size === 0) return;
+  const now = Date.now();
+  for (const [token, sentAt] of sentAlerts) {
+    if (now - sentAt > SENT_ALERT_TTL_MS) {
+      sentAlerts.delete(token);
+    }
+  }
+};
 
 const sleep = (ms: number) =>
   new Promise((resolve) => setTimeout(resolve, ms));
@@ -329,6 +352,7 @@ const recordSnapshot = async (
 };
 
 const runCycle = async () => {
+  pruneSentAlerts();
   await refreshExternalSources();
   const watchlist = await readWatchlist();
   const activeEntries = Object.values(watchlist.tokens).filter(
@@ -449,7 +473,7 @@ const runCycle = async () => {
       await upsertPromisingToken(entry.token, metrics, evaluation);
 
       // Send Telegram notification if not already sent
-      if (!sentAlerts.has(entry.token)) {
+      if (!hasRecentlySentAlert(entry.token)) {
         const alert: TokenAlert = {
           token: entry.token,
           symbol: entry.tokenMeta?.symbol,
@@ -469,7 +493,7 @@ const runCycle = async () => {
 
         const sent = await sendTelegramAlert(alert);
         if (sent) {
-          sentAlerts.add(entry.token);
+          markSentAlert(entry.token);
           console.info(`[monitor] Telegram alert sent for ${entry.token}`);
         }
       }

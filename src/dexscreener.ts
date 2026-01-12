@@ -1,5 +1,6 @@
 import { CommunityLinks } from "./types/community";
 import { TokenMetricsSnapshot } from "./utils/watchlist";
+import { guardedFetch } from "./utils/http";
 
 const API_BASE = "https://api.dexscreener.com";
 
@@ -181,12 +182,21 @@ export const fetchPairsForToken = async (
   tokenAddress: string,
 ): Promise<DexPair[]> => {
   const url = `${API_BASE}/token-pairs/v1/base/${tokenAddress}`;
-  const response = await fetch(url, {
-    headers: {
-      Accept: "application/json",
-      "User-Agent": "base-createpool-monitor/1.0",
+  const response = await guardedFetch(
+    url,
+    {
+      headers: {
+        Accept: "application/json",
+        "User-Agent": "base-createpool-monitor/1.0",
+      },
     },
-  });
+    {
+      maxRetries: 2,
+      initialDelayMs: 500,
+      timeoutMs: Number(process.env.DEXSCREENER_TIMEOUT_MS ?? 10_000),
+      concurrency: Number(process.env.DEXSCREENER_CONCURRENCY ?? 2),
+    },
+  );
 
   if (response.status === 404) {
     return [];

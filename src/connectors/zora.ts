@@ -2,6 +2,7 @@ import "../env";
 
 import { NewTokenCandidate } from "../types/newToken";
 import { findSmartFollower } from "../utils/smartFollowers";
+import { guardedFetch } from "../utils/http";
 
 const ZORA_API = "https://api-sdk.zora.engineering";
 const ZORA_API_KEY = process.env.ZORA_API_KEY;
@@ -32,12 +33,22 @@ const request = async (path: string, params: Record<string, string>) => {
   Object.entries(params).forEach(([key, value]) =>
     url.searchParams.set(key, value),
   );
-  const res = await fetch(url, {
-    headers: {
-      "api-key": ZORA_API_KEY,
-      Accept: "application/json",
+  const res = await guardedFetch(
+    url,
+    {
+      headers: {
+        "api-key": ZORA_API_KEY,
+        Accept: "application/json",
+      },
     },
-  });
+    {
+      hostKey: new URL(ZORA_API).host,
+      concurrency: Number(process.env.ZORA_CONCURRENCY ?? 4),
+      timeoutMs: Number(process.env.ZORA_TIMEOUT_MS ?? 10_000),
+      maxRetries: 2,
+      initialDelayMs: 500,
+    },
+  );
   if (!res.ok) {
     throw new Error(`Zora HTTP ${res.status}`);
   }

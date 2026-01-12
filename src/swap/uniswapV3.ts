@@ -216,6 +216,9 @@ export async function executeV3Swap(
     // 6. Get gas settings
     const { maxFeePerGas, maxPriorityFeePerGas } = await wallet.getGasPrice();
 
+    // Snapshot token balance for accurate delta reporting
+    const tokenBalanceBefore = await wallet.getTokenBalance(params.tokenOut);
+
     // 7. Execute swap
     console.log(`[v3swap] Executing swap...`);
     const swapHash = await wallet.writeContract({
@@ -252,7 +255,11 @@ export async function executeV3Swap(
     }
 
     // 9. Get actual token balance received
-    const tokenBalance = await wallet.getTokenBalance(params.tokenOut);
+    const tokenBalanceAfter = await wallet.getTokenBalance(params.tokenOut);
+    const amountReceived =
+      tokenBalanceAfter > tokenBalanceBefore
+        ? tokenBalanceAfter - tokenBalanceBefore
+        : 0n;
 
     const elapsed = Date.now() - startTime;
     console.log(`[v3swap] Swap successful in ${elapsed}ms: ${swapHash}`);
@@ -261,7 +268,7 @@ export async function executeV3Swap(
       success: true,
       txHash: swapHash,
       amountIn: params.amountIn,
-      amountOut: tokenBalance, // Actual received (may differ from quote)
+      amountOut: amountReceived, // Delta received (raw units)
       gasUsed: receipt.gasUsed,
     };
   } catch (error) {

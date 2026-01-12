@@ -12,6 +12,7 @@ import {
 } from "../types/newToken";
 import { MIN_NEYNAR_SCORE } from "../constants";
 import { getNeynarScoreByFid } from "../clients/neynar";
+import { guardedFetch } from "./http";
 
 const getMinTwitterFollowers = () =>
   Number(process.env.PROMISING_TWITTER_MIN_FOLLOWERS ?? 5000);
@@ -166,11 +167,21 @@ const fetchTwitterFollowers = async (handle: string) => {
   }
   const url = new URL("/twitter/user/info", TWITTER_API_BASE);
   url.searchParams.set("userName", handle);
-  const res = await fetch(url, {
-    headers: {
-      "x-api-key": TWITTER_API_KEY,
+  const res = await guardedFetch(
+    url,
+    {
+      headers: {
+        "x-api-key": TWITTER_API_KEY,
+      },
     },
-  });
+    {
+      hostKey: new URL(TWITTER_API_BASE).host,
+      concurrency: Number(process.env.TWITTER_CONCURRENCY ?? 4),
+      timeoutMs: Number(process.env.TWITTER_TIMEOUT_MS ?? 10_000),
+      maxRetries: 2,
+      initialDelayMs: 500,
+    },
+  );
   if (!res.ok) {
     throw new Error(`twitterapi.io HTTP ${res.status}`);
   }
@@ -186,7 +197,13 @@ const fetchTwitterFollowers = async (handle: string) => {
 const fetchFarcasterFollowers = async (fid: number) => {
   const url = new URL("/v2/user", FARCASTER_USER_API_BASE);
   url.searchParams.set("fid", String(fid));
-  const res = await fetch(url);
+  const res = await guardedFetch(url, undefined, {
+    hostKey: new URL(FARCASTER_USER_API_BASE).host,
+    concurrency: Number(process.env.FARCASTER_USER_CONCURRENCY ?? 4),
+    timeoutMs: Number(process.env.FARCASTER_USER_TIMEOUT_MS ?? 10_000),
+    maxRetries: 2,
+    initialDelayMs: 500,
+  });
   if (!res.ok) {
     throw new Error(`Warpcast user API HTTP ${res.status}`);
   }
@@ -276,7 +293,13 @@ const fetchClankerCreator = async (token: string) => {
     "https://www.clanker.world",
   );
   url.searchParams.set("address", token);
-  const res = await fetch(url);
+  const res = await guardedFetch(url, undefined, {
+    hostKey: "www.clanker.world",
+    concurrency: Number(process.env.CLANKER_CONCURRENCY ?? 4),
+    timeoutMs: Number(process.env.CLANKER_TIMEOUT_MS ?? 10_000),
+    maxRetries: 2,
+    initialDelayMs: 500,
+  });
   if (!res.ok) {
     throw new Error(`Clanker HTTP ${res.status}`);
   }
@@ -295,9 +318,19 @@ const fetchNeynarUser = async (fid: number) => {
   }
   const url = new URL("/user/bulk", "https://api.neynar.com/v2/farcaster");
   url.searchParams.set("fids", String(fid));
-  const res = await fetch(url, {
-    headers: { "x-api-key": NEYNAR_API_KEY },
-  });
+  const res = await guardedFetch(
+    url,
+    {
+      headers: { "x-api-key": NEYNAR_API_KEY },
+    },
+    {
+      hostKey: "api.neynar.com",
+      concurrency: Number(process.env.NEYNAR_CONCURRENCY ?? 4),
+      timeoutMs: Number(process.env.NEYNAR_TIMEOUT_MS ?? 10_000),
+      maxRetries: 2,
+      initialDelayMs: 500,
+    },
+  );
   if (!res.ok) {
     throw new Error(`Neynar HTTP ${res.status}`);
   }
@@ -319,9 +352,19 @@ const fetchZoraCreator = async (token: string) => {
       const url = new URL("/coin", base);
       url.searchParams.set("address", token);
       url.searchParams.set("chain", "8453");
-      const res = await fetch(url, {
-        headers: { "api-key": ZORA_API_KEY, Accept: "application/json" },
-      });
+      const res = await guardedFetch(
+        url,
+        {
+          headers: { "api-key": ZORA_API_KEY, Accept: "application/json" },
+        },
+        {
+          hostKey: new URL(base).host,
+          concurrency: Number(process.env.ZORA_CONCURRENCY ?? 4),
+          timeoutMs: Number(process.env.ZORA_TIMEOUT_MS ?? 10_000),
+          maxRetries: 2,
+          initialDelayMs: 500,
+        },
+      );
       const text = await res.text();
       if (res.status === 404) {
         continue; // try next base

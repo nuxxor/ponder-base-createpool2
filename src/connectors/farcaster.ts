@@ -1,7 +1,9 @@
 import "../env";
 
 import { Identity } from "../types/newToken";
+import { LRUCache } from "../utils/lruCache";
 import { findSmartFollower } from "../utils/smartFollowers";
+import { guardedFetch } from "../utils/http";
 
 const HUB_ORIGIN =
   process.env.FARCASTER_HUB_HTTP ?? "https://hub-api.neynar.com";
@@ -19,16 +21,27 @@ const userDataType = {
   URL: "USER_DATA_TYPE_URL",
 };
 
-const cache = new Map<number, Promise<Identity>>();
+const cache = new LRUCache<number, Promise<Identity>>(
+  5000,
+  Number(process.env.FARCASTER_IDENTITY_CACHE_TTL_MS ?? 6 * 60 * 60 * 1000),
+);
 
 const request = async (path: string, params: Record<string, string>) => {
   const url = new URL(`/v1/${path}`, HUB_ORIGIN);
   Object.entries(params).forEach(([key, value]) =>
     url.searchParams.set(key, value),
   );
-  const res = await fetch(url, {
-    headers: HUB_HEADERS,
-  });
+  const res = await guardedFetch(
+    url,
+    { headers: HUB_HEADERS },
+    {
+      hostKey: new URL(HUB_ORIGIN).host,
+      concurrency: Number(process.env.FARCASTER_HUB_CONCURRENCY ?? 4),
+      timeoutMs: Number(process.env.FARCASTER_HUB_TIMEOUT_MS ?? 10_000),
+      maxRetries: 2,
+      initialDelayMs: 500,
+    },
+  );
   if (!res.ok) {
     throw new Error(`Farcaster hub HTTP ${res.status}`);
   }
@@ -82,9 +95,8 @@ const computeScore = (identity: Identity): number => {
 export const resolveFarcasterIdentity = async (
   fid: number,
 ): Promise<Identity> => {
-  if (cache.has(fid)) {
-    return cache.get(fid)!;
-  }
+  const cached = cache.get(fid);
+  if (cached) return cached;
 
   const task = (async (): Promise<Identity> => {
     const [twitter, username, website, verifiedAddrs] = await Promise.all([
@@ -116,5 +128,8 @@ export const resolveFarcasterIdentity = async (
   })();
 
   cache.set(fid, task);
+  task.catch(() => {
+    cache.delete(fid);
+  });
   return task;
 };
