@@ -39,6 +39,10 @@ import { refreshExternalSources } from "./pipelines/launchpads";
 import { enforcePromisingSocialGate } from "./utils/socialProof";
 import { sendTelegramAlert, TokenAlert } from "./services/telegram";
 
+const MONITOR_TELEGRAM_ENABLED =
+  String(process.env.MONITOR_TELEGRAM_ENABLED ?? "true").toLowerCase() ===
+  "true";
+
 // Sent alerts cache to avoid duplicate notifications (bounded via TTL)
 const SENT_ALERT_TTL_MS = Number(
   process.env.SENT_ALERT_TTL_MS ?? 7 * 24 * 60 * 60 * 1000,
@@ -473,7 +477,7 @@ const runCycle = async () => {
       await upsertPromisingToken(entry.token, metrics, evaluation);
 
       // Send Telegram notification if not already sent
-      if (!hasRecentlySentAlert(entry.token)) {
+      if (MONITOR_TELEGRAM_ENABLED && !hasRecentlySentAlert(entry.token)) {
         const alert: TokenAlert = {
           token: entry.token,
           symbol: entry.tokenMeta?.symbol,

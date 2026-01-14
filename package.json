@@ -11,13 +11,19 @@
     "lint": "eslint . --ext .ts,.tsx",
     "typecheck": "tsc",
     "monitor": "tsx src/monitor.ts",
-    "sniper": "tsx src/sniper.ts",
+    "sniper": "LOG_LEVEL=info LOG_PRETTY=true tsx src/sniper.ts",
+    "sniper:quiet": "LOG_LEVEL=warn tsx src/sniper.ts",
+    "sniper:silent": "LOG_LEVEL=error tsx src/sniper.ts",
+    "sniper:debug": "LOG_LEVEL=debug LOG_PRETTY=true tsx src/sniper.ts",
+    "sniper:file": "LOG_LEVEL=info LOG_TO_FILE=true tsx src/sniper.ts",
     "poll:launchpads": "tsx src/pipelines/launchpads.ts",
     "test:social-gate": "TMPDIR=./tmp node --import tsx/esm scripts/testSocialGate.ts",
     "test:neynar-score": "node --import tsx/esm scripts/testNeynarScore.ts"
   },
   "dependencies": {
     "hono": "^4.5.0",
+    "pino": "^10.1.1",
+    "pino-pretty": "^13.1.3",
     "ponder": "^0.14.13",
     "viem": "^2.21.3"
   },

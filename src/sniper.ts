@@ -13,12 +13,13 @@ import { sendTelegramAlert, sendSimpleMessage, TokenAlert } from "./services/tel
 import { fetchPairsForToken, aggregateTokenMetrics } from "./dexscreener";
 import { executeBuy, isAutoBuyReady, getWalletInfo, BuyRequest } from "./services/autobuy";
 import { LRUCache } from "./utils/lruCache";
+import { guardedFetch } from "./utils/http";
 import * as fs from "fs";
 import * as path from "path";
 
 // ============= CONFIGURATION =============
 
-const WS_RPC_URL = process.env.WS_RPC_URL || "ws://127.0.0.1:18546";
+const WS_RPC_URL = process.env.WS_RPC_URL || "ws://127.0.0.1:28546";
 
 // Factory addresses
 const CLANKER_FACTORY = "0xE85A59c628F7d27878ACeB4bf3b35733630083a9";
@@ -41,6 +42,15 @@ const ZORA_VIP_ADDRESSES = new Set([
 // Neynar API
 const NEYNAR_API_KEY = process.env.NEYNAR_API_KEY;
 const NEYNAR_API_URL = "https://api.neynar.com/v2/farcaster/user/bulk";
+const NEYNAR_API_HOST = new URL("https://api.neynar.com").host;
+const NEYNAR_CONCURRENCY = Number(process.env.NEYNAR_CONCURRENCY ?? 4);
+const NEYNAR_TIMEOUT_MS = Number(process.env.NEYNAR_TIMEOUT_MS ?? 10_000);
+const SNIPER_NEYNAR_ADDRESS_CACHE_TTL_MS = Number(
+  process.env.SNIPER_NEYNAR_ADDRESS_CACHE_TTL_MS ?? 10 * 60 * 1000,
+);
+const SNIPER_NEYNAR_NOT_FOUND_CACHE_TTL_MS = Number(
+  process.env.SNIPER_NEYNAR_NOT_FOUND_CACHE_TTL_MS ?? 60 * 1000,
+);
 
 // Zora API
 const ZORA_API_KEY = process.env.ZORA_API_KEY;
@@ -52,9 +62,15 @@ const ZORA_API_BASE =
 const ZORA_API_BASE_FALLBACK = (
   process.env.ZORA_API_BASE_FALLBACK ?? "https://api-sdk.zora.co"
 ).replace(/\/$/, "");
+const ZORA_CONCURRENCY = Number(process.env.ZORA_CONCURRENCY ?? 4);
+const ZORA_TIMEOUT_MS = Number(process.env.ZORA_TIMEOUT_MS ?? 10_000);
+const ZORA_HOST_KEY = "zora-api";
 
 // Clanker API for creator lookup
 const CLANKER_API_URL = "https://www.clanker.world/api/tokens";
+const CLANKER_API_HOST = new URL(CLANKER_API_URL).host;
+const CLANKER_CONCURRENCY = Number(process.env.CLANKER_CONCURRENCY ?? 4);
+const CLANKER_TIMEOUT_MS = Number(process.env.CLANKER_TIMEOUT_MS ?? 10_000);
 
 // Minimum thresholds - STRICT MODE
 const MIN_NEYNAR = 0.90; // 90% Neynar score required
@@ -62,10 +78,59 @@ const MIN_TWITTER_FOLLOWERS = 70000; // 70K Twitter followers (for "big account"
 const MIN_TWITTER_MINIMUM = 5000; // 5K Twitter minimum (must have at least this)
 const MIN_FARCASTER_FOLLOWERS = 10000; // 10K Farcaster followers
 
+const SNIPER_NEYNAR_GATE_ENABLED =
+  String(process.env.SNIPER_NEYNAR_GATE_ENABLED ?? "false").toLowerCase() ===
+  "true";
+const SNIPER_MIN_NEYNAR_SCORE = Math.max(
+  0,
+  Math.min(1, Number(process.env.SNIPER_MIN_NEYNAR_SCORE ?? MIN_NEYNAR)),
+);
+
 // Liquidity watchlist config
 const MIN_LIQUIDITY_USD = 5000; // $5K minimum liquidity to send alert
 const WATCHLIST_CHECK_INTERVAL_MS = 10000; // Check every 10 seconds
 const WATCHLIST_MAX_AGE_MS = 60 * 60 * 1000; // 1 hour max watch time
+
+const SNIPER_FAST_TIMEOUT_MS = Math.max(
+  0,
+  Number(process.env.SNIPER_FAST_TIMEOUT_MS ?? 2500),
+);
+
+const SNIPER_ALERT_ON_CREATE =
+  String(process.env.SNIPER_ALERT_ON_CREATE ?? "true").toLowerCase() === "true";
+const SNIPER_ALERT_ON_LIQUIDITY =
+  String(process.env.SNIPER_ALERT_ON_LIQUIDITY ?? "true").toLowerCase() ===
+  "true";
+const SNIPER_LIQUIDITY_ALERT_AFTER_CREATE =
+  String(process.env.SNIPER_LIQUIDITY_ALERT_AFTER_CREATE ?? "false").toLowerCase() ===
+  "true";
+const SNIPER_ENABLE_SLOW_FALLBACK =
+  String(process.env.SNIPER_ENABLE_SLOW_FALLBACK ?? "true").toLowerCase() ===
+  "true";
+const SNIPER_SLOW_VALIDATION_CONCURRENCY = Math.max(
+  1,
+  Number(process.env.SNIPER_SLOW_VALIDATION_CONCURRENCY ?? 2),
+);
+
+const SNIPER_EVENT_STALE_THRESHOLD_MS = Math.max(
+  0,
+  Number(process.env.SNIPER_EVENT_STALE_THRESHOLD_MS ?? 10 * 60 * 1000),
+);
+const SNIPER_STALE_WARNING_INTERVAL_MS = Math.max(
+  0,
+  Number(process.env.SNIPER_STALE_WARNING_INTERVAL_MS ?? 5 * 60 * 1000),
+);
+const SNIPER_RESUBSCRIBE_COOLDOWN_MS = Math.max(
+  0,
+  Number(process.env.SNIPER_RESUBSCRIBE_COOLDOWN_MS ?? 10 * 60 * 1000),
+);
+const SNIPER_STALE_PROBE_INTERVAL_MS = Math.max(
+  0,
+  Number(process.env.SNIPER_STALE_PROBE_INTERVAL_MS ?? 5 * 60 * 1000),
+);
+const SNIPER_STALE_PROBE_BLOCKS = BigInt(
+  Math.max(0, Number(process.env.SNIPER_STALE_PROBE_BLOCKS ?? 500)),
+);
 
 // Concurrency controls (tune for speed vs API limits)
 const SNIPER_EVENT_CONCURRENCY = Math.max(
@@ -186,6 +251,28 @@ const processedEventIds = new LRUCache<string, true>(
   SNIPER_DEDUP_TTL_MS,
 );
 
+const SNIPER_CREATE_ALERT_DEDUP_TTL_MS = Number(
+  process.env.SNIPER_CREATE_ALERT_DEDUP_TTL_MS ?? 6 * 60 * 60 * 1000,
+);
+const createAlertedTokens = new LRUCache<string, true>(
+  50_000,
+  SNIPER_CREATE_ALERT_DEDUP_TTL_MS,
+);
+
+const shouldRetryHttp = (error: unknown): boolean => {
+  if (error instanceof TypeError) return true;
+  if (error instanceof Error && error.name === "AbortError") return true;
+  if (error instanceof Error && /^HTTP (429|5\\d\\d)\\b/.test(error.message)) {
+    return true;
+  }
+  return false;
+};
+
+const shouldWatchLiquidity = (): boolean => {
+  // Always watch liquidity if we'll alert on it, or if auto-buy needs the signal.
+  return SNIPER_ALERT_ON_LIQUIDITY || isAutoBuyReady().ready;
+};
+
 // API Health tracking
 let zoraApiHealthy = true;
 let zoraApiLastCheck = 0;
@@ -207,24 +294,18 @@ async function checkZoraApiHealth(): Promise<boolean> {
     url.searchParams.set("address", "0x0000000000000000000000000000000000000000");
     url.searchParams.set("chain", "8453");
 
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 5000);
-
-    const res = await fetch(url, {
-      headers: { "api-key": ZORA_API_KEY ?? "", Accept: "application/json" },
-      signal: controller.signal,
-    });
-    clearTimeout(timeout);
-
-    // 404 is fine - it means API is responding (token doesn't exist)
-    // 503 means API is down
-    if (res.status === 503) {
-      if (zoraApiHealthy) {
-        console.warn("[sniper] 🔴 Zora API health check FAILED (503)");
-      }
-      zoraApiHealthy = false;
-      return false;
-    }
+    await guardedFetch(
+      url,
+      {
+        headers: { "api-key": ZORA_API_KEY ?? "", Accept: "application/json" },
+      },
+      {
+        hostKey: ZORA_HOST_KEY,
+        concurrency: ZORA_CONCURRENCY,
+        timeoutMs: Math.min(ZORA_TIMEOUT_MS, 5000),
+        maxRetries: 0,
+      },
+    );
 
     if (!zoraApiHealthy) {
       const downtime = Math.floor((now - zoraApiLastHealthyAt) / 1000);
@@ -263,6 +344,58 @@ const createConcurrencyLimiter = (concurrency: number) => {
       next();
     }
   };
+};
+
+const runSlowValidationTask = createConcurrencyLimiter(
+  SNIPER_SLOW_VALIDATION_CONCURRENCY,
+);
+const slowValidationInFlight = new Set<string>();
+
+const scheduleSlowValidation = (token: TokenInfo, detectedAt: number) => {
+  if (!SNIPER_ENABLE_SLOW_FALLBACK) return;
+  const tokenKey = token.address.toLowerCase();
+  if (slowValidationInFlight.has(tokenKey)) return;
+  slowValidationInFlight.add(tokenKey);
+
+  void runSlowValidationTask(async () => {
+    try {
+      const validation = await validateTokenWithRetry(token, 3);
+      const totalTime = Date.now() - detectedAt;
+
+      if (!validation.passes || !validation.creatorInfo) {
+        console.log(
+          `[sniper] Slow validation rejected: ${validation.reasons.join(", ") || "unknown"} (${totalTime}ms)`,
+        );
+        return;
+      }
+
+      const twitterFollowers = validation.creatorInfo.twitterFollowers ?? 0;
+      if (twitterFollowers >= MIN_TWITTER_FOLLOWERS) {
+        console.log(
+          `[sniper] 🚀 BIG ACCOUNT (${twitterFollowers.toLocaleString()} Twitter) - Sending create alert (slow path)`,
+        );
+        if (SNIPER_ALERT_ON_CREATE) {
+          await sendCreateAlert(token, validation.creatorInfo);
+        }
+        return;
+      }
+
+      console.log(`[sniper] ✅ Slow validation passed (${totalTime}ms total)`);
+      if (SNIPER_ALERT_ON_CREATE) {
+        await sendCreateAlert(token, validation.creatorInfo);
+      }
+      if (shouldWatchLiquidity()) {
+        addToWatchlist(token, validation.creatorInfo);
+      }
+    } catch (error) {
+      console.error(
+        "[sniper] Slow validation error:",
+        error instanceof Error ? error.message : error,
+      );
+    } finally {
+      slowValidationInFlight.delete(tokenKey);
+    }
+  });
 };
 
 const compareLogsByOrder = (a: any, b: any) => {
@@ -429,10 +562,31 @@ let watchlistCheckInFlight = false;
 const creatorTokenCount = new Map<string, { count: number; firstSeen: number }>();
 const MAX_TOKENS_PER_CREATOR = 2; // Max tokens per creator in time window
 const CREATOR_WINDOW_MS = 24 * 60 * 60 * 1000; // 24 hours
+const spamCountedTokens = new LRUCache<string, true>(50_000, CREATOR_WINDOW_MS);
 
 // Twitter API
 const TWITTER_API_BASE = (process.env.TWITTER_API_BASE ?? "https://api.twitterapi.io").replace(/\/$/, "");
 const TWITTER_API_KEY = process.env.TWITTER_API_KEY;
+const TWITTER_API_HOST = (() => {
+  try {
+    return new URL(TWITTER_API_BASE).host;
+  } catch {
+    return "twitter-api";
+  }
+})();
+const TWITTER_CONCURRENCY = Number(process.env.TWITTER_CONCURRENCY ?? 4);
+const TWITTER_TIMEOUT_MS = Number(process.env.TWITTER_TIMEOUT_MS ?? 10_000);
+const SNIPER_TWITTER_FOLLOWERS_CACHE_TTL_MS = Number(
+  process.env.SNIPER_TWITTER_FOLLOWERS_CACHE_TTL_MS ?? 10 * 60 * 1000,
+);
+const SNIPER_TWITTER_NOT_FOUND_CACHE_TTL_MS = Number(
+  process.env.SNIPER_TWITTER_NOT_FOUND_CACHE_TTL_MS ?? 60 * 1000,
+);
+const twitterFollowersCache = new LRUCache<string, number | null>(
+  20_000,
+  SNIPER_TWITTER_FOLLOWERS_CACHE_TTL_MS,
+);
+const twitterFollowersInFlight = new Map<string, Promise<number | null>>();
 
 // ============= EVENT SIGNATURES =============
 
@@ -529,16 +683,44 @@ interface NeynarUserData {
   score: number;
   followers: number;
   fid: number;
+  username?: string;
   twitterHandle?: string;
 }
+
+const neynarUserByAddressCache = new LRUCache<string, NeynarUserData | null>(
+  20_000,
+  SNIPER_NEYNAR_ADDRESS_CACHE_TTL_MS,
+);
+const neynarUserByAddressInFlight = new Map<
+  string,
+  Promise<NeynarUserData | null>
+>();
+
+const neynarUserByUsernameCache = new LRUCache<string, NeynarUserData | null>(
+  20_000,
+  SNIPER_NEYNAR_ADDRESS_CACHE_TTL_MS,
+);
+const neynarUserByUsernameInFlight = new Map<
+  string,
+  Promise<NeynarUserData | null>
+>();
 
 async function getNeynarScore(fid: number): Promise<{ score: number; followers: number } | null> {
   if (!NEYNAR_API_KEY) return null;
 
   try {
-    const response = await fetch(`${NEYNAR_API_URL}?fids=${fid}`, {
-      headers: { "x-api-key": NEYNAR_API_KEY },
-    });
+    const response = await guardedFetch(
+      `${NEYNAR_API_URL}?fids=${fid}`,
+      { headers: { "x-api-key": NEYNAR_API_KEY, Accept: "application/json" } },
+      {
+        hostKey: NEYNAR_API_HOST,
+        concurrency: NEYNAR_CONCURRENCY,
+        timeoutMs: NEYNAR_TIMEOUT_MS,
+        maxRetries: 3,
+        initialDelayMs: 500,
+        shouldRetry: shouldRetryHttp,
+      },
+    );
 
     if (!response.ok) return null;
 
@@ -560,138 +742,316 @@ async function getNeynarScore(fid: number): Promise<{ score: number; followers: 
 async function getNeynarUserByUsername(username: string): Promise<NeynarUserData | null> {
   if (!NEYNAR_API_KEY) return null;
 
-  try {
-    const response = await fetch(
-      `https://api.neynar.com/v2/farcaster/user/by_username?username=${encodeURIComponent(username)}`,
-      { headers: { "x-api-key": NEYNAR_API_KEY } }
-    );
+  const key = username.replace(/^@/, "").trim().toLowerCase();
+  if (!key) return null;
 
-    if (!response.ok) return null;
-
-    const data = await response.json() as {
-      user?: {
-        fid?: number;
-        follower_count?: number;
-        score?: number;
-        experimental?: { neynar_user_score?: number };
-        verified_accounts?: Array<{ platform?: string; username?: string }>;
-      };
-    };
-
-    const user = data.user;
-    if (!user || !user.fid) return null;
-
-    // Extract Twitter handle from verified_accounts - validate with parseTwitterHandle
-    const twitterAccount = user.verified_accounts?.find(
-      (acc) => acc.platform?.toLowerCase() === "x" || acc.platform?.toLowerCase() === "twitter"
-    );
-    // Validate the handle - parseTwitterHandle handles URL and direct handle formats
-    const validatedHandle = twitterAccount?.username
-      ? parseTwitterHandle(twitterAccount.username)
-      : null;
-
-    return {
-      fid: user.fid,
-      score: user.score ?? user.experimental?.neynar_user_score ?? 0,
-      followers: user.follower_count ?? 0,
-      twitterHandle: validatedHandle ?? undefined,
-    };
-  } catch (error) {
-    console.error("[sniper] Neynar username lookup failed:", error);
-    return null;
+  const cached = neynarUserByUsernameCache.get(key);
+  if (cached !== undefined) {
+    return cached;
   }
+
+  const inFlight = neynarUserByUsernameInFlight.get(key);
+  if (inFlight) {
+    return inFlight;
+  }
+
+  const task = (async () => {
+    try {
+      const response = await guardedFetch(
+        `https://api.neynar.com/v2/farcaster/user/by_username?username=${encodeURIComponent(key)}`,
+        { headers: { "x-api-key": NEYNAR_API_KEY, Accept: "application/json" } },
+        {
+          hostKey: NEYNAR_API_HOST,
+          concurrency: NEYNAR_CONCURRENCY,
+          timeoutMs: NEYNAR_TIMEOUT_MS,
+          maxRetries: 3,
+          initialDelayMs: 500,
+          shouldRetry: shouldRetryHttp,
+        },
+      );
+
+      if (response.status === 404) {
+        neynarUserByUsernameCache.set(
+          key,
+          null,
+          SNIPER_NEYNAR_NOT_FOUND_CACHE_TTL_MS,
+        );
+        return null;
+      }
+
+      if (!response.ok) {
+        return null;
+      }
+
+      const data = (await response.json()) as {
+        user?: {
+          fid?: number;
+          username?: string;
+          follower_count?: number;
+          score?: number;
+          experimental?: { neynar_user_score?: number };
+          verified_accounts?: Array<{ platform?: string; username?: string }>;
+        };
+      };
+
+      const user = data.user;
+      if (!user || !user.fid) return null;
+
+      // Extract Twitter handle from verified_accounts - validate with parseTwitterHandle
+      const twitterAccount = user.verified_accounts?.find(
+        (acc) =>
+          acc.platform?.toLowerCase() === "x" ||
+          acc.platform?.toLowerCase() === "twitter",
+      );
+      // Validate the handle - parseTwitterHandle handles URL and direct handle formats
+      const validatedHandle = twitterAccount?.username
+        ? parseTwitterHandle(twitterAccount.username)
+        : null;
+
+      const result: NeynarUserData = {
+        fid: user.fid,
+        username: user.username,
+        score: user.score ?? user.experimental?.neynar_user_score ?? 0,
+        followers: user.follower_count ?? 0,
+        twitterHandle: validatedHandle ?? undefined,
+      };
+
+      neynarUserByUsernameCache.set(key, result);
+      return result;
+    } catch (error) {
+      console.error(
+        "[sniper] Neynar username lookup failed:",
+        error instanceof Error ? error.message : error,
+      );
+      return null;
+    } finally {
+      neynarUserByUsernameInFlight.delete(key);
+    }
+  })();
+
+  neynarUserByUsernameInFlight.set(key, task);
+  return task;
 }
 
-// Lookup Farcaster user by wallet address (fallback when Zora API fails)
-async function getNeynarUserByAddress(address: string): Promise<NeynarUserData | null> {
+// Lookup Farcaster user by wallet address (fast-path + fallback when Zora API fails)
+async function getNeynarUserByAddress(
+  address: string,
+  mode: "fast" | "slow" = "slow",
+): Promise<NeynarUserData | null> {
   if (!NEYNAR_API_KEY) return null;
 
-  try {
-    const response = await fetch(
-      `https://api.neynar.com/v2/farcaster/user/bulk-by-address?addresses=${address.toLowerCase()}`,
-      { headers: { api_key: NEYNAR_API_KEY } }
-    );
-
-    if (!response.ok) {
-      if (response.status === 404) return null;
-      console.warn(`[sniper] Neynar address lookup HTTP ${response.status}`);
-      return null;
-    }
-
-    const data = await response.json() as {
-      [address: string]: Array<{
-        fid?: number;
-        username?: string;
-        follower_count?: number;
-        score?: number;
-        experimental?: { neynar_user_score?: number };
-        verified_accounts?: Array<{ platform?: string; username?: string }>;
-      }>;
-    };
-
-    // Get users for this address
-    const users = data[address.toLowerCase()];
-    if (!users || users.length === 0) return null;
-
-    // Take the first (primary) user
-    const user = users[0];
-    if (!user || !user.fid) return null;
-
-    console.log(`[sniper] 🔄 Neynar fallback found user @${user.username} (fid: ${user.fid}) for wallet ${address.slice(0, 10)}...`);
-
-    // Extract Twitter handle
-    const twitterAccount = user.verified_accounts?.find(
-      (acc) => acc.platform?.toLowerCase() === "x" || acc.platform?.toLowerCase() === "twitter"
-    );
-    const validatedHandle = twitterAccount?.username
-      ? parseTwitterHandle(twitterAccount.username)
-      : null;
-
-    return {
-      fid: user.fid,
-      score: user.score ?? user.experimental?.neynar_user_score ?? 0,
-      followers: user.follower_count ?? 0,
-      twitterHandle: validatedHandle ?? undefined,
-    };
-  } catch (error) {
-    console.error("[sniper] Neynar address lookup failed:", error);
-    return null;
+  const addressLower = address.toLowerCase();
+  const cached = neynarUserByAddressCache.get(addressLower);
+  if (cached !== undefined) {
+    return cached;
   }
+
+  const inFlight = neynarUserByAddressInFlight.get(addressLower);
+  if (inFlight) {
+    if (mode === "fast" && SNIPER_FAST_TIMEOUT_MS > 0) {
+      return Promise.race([
+        inFlight,
+        new Promise<null>((resolve) =>
+          setTimeout(() => resolve(null), SNIPER_FAST_TIMEOUT_MS),
+        ),
+      ]);
+    }
+    return inFlight;
+  }
+
+  const task = (async () => {
+    try {
+      const response = await guardedFetch(
+        `https://api.neynar.com/v2/farcaster/user/bulk-by-address?addresses=${addressLower}`,
+        { headers: { api_key: NEYNAR_API_KEY, Accept: "application/json" } },
+        {
+          hostKey: NEYNAR_API_HOST,
+          concurrency: NEYNAR_CONCURRENCY,
+          timeoutMs: NEYNAR_TIMEOUT_MS,
+          maxRetries: 2,
+          initialDelayMs: 250,
+          shouldRetry: shouldRetryHttp,
+        },
+      );
+
+      if (response.status === 404) {
+        neynarUserByAddressCache.set(
+          addressLower,
+          null,
+          SNIPER_NEYNAR_NOT_FOUND_CACHE_TTL_MS,
+        );
+        return null;
+      }
+
+      if (!response.ok) {
+        console.warn(`[sniper] Neynar address lookup HTTP ${response.status}`);
+        return null;
+      }
+
+      const data = (await response.json()) as {
+        [address: string]: Array<{
+          fid?: number;
+          username?: string;
+          follower_count?: number;
+          score?: number;
+          experimental?: { neynar_user_score?: number };
+          verified_accounts?: Array<{ platform?: string; username?: string }>;
+        }>;
+      };
+
+      // Get users for this address
+      const users = data[addressLower];
+      if (!users || users.length === 0) return null;
+
+      // Take the first (primary) user
+      const user = users[0];
+      if (!user || !user.fid) return null;
+
+      // Extract Twitter handle
+      const twitterAccount = user.verified_accounts?.find(
+        (acc) =>
+          acc.platform?.toLowerCase() === "x" ||
+          acc.platform?.toLowerCase() === "twitter",
+      );
+      const validatedHandle = twitterAccount?.username
+        ? parseTwitterHandle(twitterAccount.username)
+        : null;
+
+      const result: NeynarUserData = {
+        fid: user.fid,
+        username: user.username,
+        score: user.score ?? user.experimental?.neynar_user_score ?? 0,
+        followers: user.follower_count ?? 0,
+        twitterHandle: validatedHandle ?? undefined,
+      };
+
+      neynarUserByAddressCache.set(addressLower, result);
+      return result;
+    } catch (error) {
+      console.error(
+        "[sniper] Neynar address lookup failed:",
+        error instanceof Error ? error.message : error,
+      );
+      return null;
+    } finally {
+      neynarUserByAddressInFlight.delete(addressLower);
+    }
+  })();
+
+  neynarUserByAddressInFlight.set(addressLower, task);
+
+  if (mode === "fast" && SNIPER_FAST_TIMEOUT_MS > 0) {
+    return Promise.race([
+      task,
+      new Promise<null>((resolve) =>
+        setTimeout(() => resolve(null), SNIPER_FAST_TIMEOUT_MS),
+      ),
+    ]);
+  }
+
+  return task;
 }
 
 // ============= TWITTER LOOKUP =============
 
-async function getTwitterFollowers(handle: string): Promise<number | null> {
+async function getTwitterFollowers(
+  handle: string,
+  mode: "fast" | "slow" = "slow",
+): Promise<number | null> {
   if (!TWITTER_API_KEY) {
     console.warn("[sniper] TWITTER_API_KEY not configured");
     return null;
   }
 
-  try {
-    const url = new URL("/twitter/user/info", TWITTER_API_BASE);
-    url.searchParams.set("userName", handle);
+  const key = handle.replace(/^@/, "").trim().toLowerCase();
+  if (!key) return null;
 
-    const response = await fetch(url, {
-      headers: { "x-api-key": TWITTER_API_KEY },
-    });
-
-    if (!response.ok) {
-      console.warn(`[sniper] Twitter API error: ${response.status}`);
-      return null;
-    }
-
-    const data = await response.json() as { data?: { followers?: number; followersCount?: number } };
-    const followers = data?.data?.followers ?? data?.data?.followersCount;
-
-    if (typeof followers === "number" && Number.isFinite(followers)) {
-      return followers;
-    }
-
-    return null;
-  } catch (error) {
-    console.error("[sniper] Twitter lookup failed:", error);
-    return null;
+  const cached = twitterFollowersCache.get(key);
+  if (cached !== undefined) {
+    return cached;
   }
+
+  const inFlight = twitterFollowersInFlight.get(key);
+  if (inFlight) {
+    if (mode === "fast" && SNIPER_FAST_TIMEOUT_MS > 0) {
+      return Promise.race([
+        inFlight,
+        new Promise<null>((resolve) =>
+          setTimeout(() => resolve(null), SNIPER_FAST_TIMEOUT_MS),
+        ),
+      ]);
+    }
+    return inFlight;
+  }
+
+  const task = (async () => {
+    try {
+      const url = new URL("/twitter/user/info", TWITTER_API_BASE);
+      url.searchParams.set("userName", key);
+
+      const response = await guardedFetch(
+        url,
+        {
+          headers: { "x-api-key": TWITTER_API_KEY, Accept: "application/json" },
+        },
+        {
+          hostKey: TWITTER_API_HOST,
+          concurrency: TWITTER_CONCURRENCY,
+          timeoutMs: TWITTER_TIMEOUT_MS,
+          maxRetries: 2,
+          initialDelayMs: 250,
+          shouldRetry: shouldRetryHttp,
+        },
+      );
+
+      if (response.status === 404) {
+        twitterFollowersCache.set(
+          key,
+          null,
+          SNIPER_TWITTER_NOT_FOUND_CACHE_TTL_MS,
+        );
+        return null;
+      }
+
+      if (!response.ok) {
+        console.warn(`[sniper] Twitter API error: ${response.status}`);
+        return null;
+      }
+
+      const data = (await response.json()) as {
+        data?: { followers?: number; followersCount?: number };
+      };
+      const followers = data?.data?.followers ?? data?.data?.followersCount;
+
+      if (typeof followers === "number" && Number.isFinite(followers)) {
+        twitterFollowersCache.set(key, followers);
+        return followers;
+      }
+
+      return null;
+    } catch (error) {
+      console.error(
+        "[sniper] Twitter lookup failed:",
+        error instanceof Error ? error.message : error,
+      );
+      return null;
+    } finally {
+      twitterFollowersInFlight.delete(key);
+    }
+  })();
+
+  twitterFollowersInFlight.set(key, task);
+
+  if (mode === "fast" && SNIPER_FAST_TIMEOUT_MS > 0) {
+    return Promise.race([
+      task,
+      new Promise<null>((resolve) =>
+        setTimeout(() => resolve(null), SNIPER_FAST_TIMEOUT_MS),
+      ),
+    ]);
+  }
+
+  return task;
 }
 
 function parseTwitterHandle(url?: string | null): string | null {
@@ -741,8 +1101,17 @@ async function getClankerCreator(tokenAddress: string): Promise<CreatorInfo | nu
     const addrLower = tokenAddress.toLowerCase();
 
     // Search by contract address
-    const response = await fetch(
-      `${CLANKER_API_URL}?contractAddress=${addrLower}`
+    const response = await guardedFetch(
+      `${CLANKER_API_URL}?contractAddress=${addrLower}`,
+      { headers: { Accept: "application/json" } },
+      {
+        hostKey: CLANKER_API_HOST,
+        concurrency: CLANKER_CONCURRENCY,
+        timeoutMs: CLANKER_TIMEOUT_MS,
+        maxRetries: 2,
+        initialDelayMs: 500,
+        shouldRetry: shouldRetryHttp,
+      },
     );
 
     if (!response.ok) return null;
@@ -862,38 +1231,45 @@ async function fetchZoraCoin(tokenAddress: string): Promise<ZoraCoinResult> {
       const url = new URL("/coin", base);
       url.searchParams.set("address", tokenAddress);
       url.searchParams.set("chain", "8453");
-      const res = await fetch(url, {
-        headers: { "api-key": ZORA_API_KEY, Accept: "application/json" },
-      });
-      const text = await res.text();
+      const res = await guardedFetch(
+        url,
+        {
+          headers: { "api-key": ZORA_API_KEY, Accept: "application/json" },
+        },
+        {
+          hostKey: ZORA_HOST_KEY,
+          concurrency: ZORA_CONCURRENCY,
+          timeoutMs: ZORA_TIMEOUT_MS,
+          maxRetries: 2,
+          initialDelayMs: 500,
+          shouldRetry: shouldRetryHttp,
+        },
+      );
+
       if (res.status === 404) {
         console.log(`[sniper] Zora API 404 for ${tokenAddress} on ${base}`);
         got404Count++;
         continue;
       }
       if (!res.ok) {
-        // Track 503 errors specifically (infrastructure issues)
-        if (res.status === 503) {
-          got503 = true;
-          lastError = `Zora HTTP 503 (no healthy upstream): ${text.slice(0, 80)}`;
-          console.warn(`[sniper] ⚠️ Zora API 503 on ${base} - infrastructure issue`);
-        } else if (res.status >= 500) {
-          lastError = `Zora HTTP ${res.status} (server error): ${text.slice(0, 120)}`;
-        } else {
-          lastError = `Zora HTTP ${res.status}: ${text.slice(0, 120)}`;
-        }
+        lastError = `Zora HTTP ${res.status}`;
         continue;
       }
       try {
         // API is healthy again
         zoraApiHealthy = true;
-        return { status: "success", data: JSON.parse(text) as ZoraCoinResponse };
+        return { status: "success", data: (await res.json()) as ZoraCoinResponse };
       } catch (error) {
-        lastError = `Zora non-JSON response (${res.status}): ${text.slice(0, 120)}`;
+        lastError = `Zora non-JSON response (${res.status})`;
         continue;
       }
     } catch (error) {
-      lastError = error instanceof Error ? error.message : String(error);
+      const message = error instanceof Error ? error.message : String(error);
+      lastError = message;
+      if (/\\bHTTP 503\\b/.test(message)) {
+        got503 = true;
+        console.warn(`[sniper] ⚠️ Zora API 503 on ${base} - infrastructure issue`);
+      }
       continue;
     }
   }
@@ -1016,14 +1392,190 @@ interface ValidationResult {
   creatorInfo?: CreatorInfo;
 }
 
-async function validateToken(token: TokenInfo): Promise<ValidationResult> {
+const checkCreatorSpamAndRecord = (
+  creatorInfo: CreatorInfo,
+  tokenAddress: string,
+): { passes: boolean; reason?: string } => {
+  const tokenKey = tokenAddress.toLowerCase();
+  if (spamCountedTokens.has(tokenKey)) {
+    return { passes: true };
+  }
+
+  const creatorKey =
+    creatorInfo.fid?.toString() || creatorInfo.twitterHandle || "unknown";
+  if (creatorKey === "unknown") {
+    return { passes: true };
+  }
+
+  const now = Date.now();
+  const creatorData = creatorTokenCount.get(creatorKey);
+
+  if (!creatorData || now - creatorData.firstSeen > CREATOR_WINDOW_MS) {
+    creatorTokenCount.set(creatorKey, { count: 1, firstSeen: now });
+    spamCountedTokens.set(tokenKey, true);
+    return { passes: true };
+  }
+
+  if (creatorData.count >= MAX_TOKENS_PER_CREATOR) {
+    console.log(
+      `[sniper] ⚠️ Spam detected: ${creatorKey} has ${creatorData.count} tokens in 24h`,
+    );
+    return { passes: false, reason: `spam: ${creatorKey}` };
+  }
+
+  creatorData.count++;
+  spamCountedTokens.set(tokenKey, true);
+  return { passes: true };
+};
+
+const evaluateCreator = (creatorInfo: CreatorInfo): Omit<ValidationResult, "creatorInfo"> => {
+  const reasons: string[] = [];
+
+  // === STRICT VALIDATION ===
+  const neynarScore = creatorInfo.neynarScore;
+  const twitterFollowers = creatorInfo.twitterFollowers;
+  const farcasterFollowers = creatorInfo.farcasterFollowers;
+
+  const twitterBigAccount =
+    twitterFollowers !== undefined && twitterFollowers >= MIN_TWITTER_FOLLOWERS;
+
+  // 1. Neynar score check (optional gate; can be bypassed by a big Twitter account)
+  const neynarPasses =
+    !SNIPER_NEYNAR_GATE_ENABLED ||
+    twitterBigAccount ||
+    (neynarScore !== undefined && neynarScore >= SNIPER_MIN_NEYNAR_SCORE);
+
+  // 2. Twitter minimum check (REQUIRED: if Twitter exists, must be >= 5K)
+  const twitterMinimumPasses =
+    twitterFollowers === undefined || twitterFollowers >= MIN_TWITTER_MINIMUM;
+
+  // 3. Follower check (REQUIRED: Twitter >= 100K OR Farcaster >= 10K)
+  const twitterPasses =
+    twitterFollowers !== undefined && twitterFollowers >= MIN_TWITTER_FOLLOWERS;
+  const farcasterPasses =
+    farcasterFollowers !== undefined && farcasterFollowers >= MIN_FARCASTER_FOLLOWERS;
+  const followerPasses = twitterPasses || farcasterPasses;
+
+  // Log the checks
+  console.log(
+    `[sniper] Neynar: ${
+      neynarScore !== undefined ? `${(neynarScore * 100).toFixed(0)}%` : "N/A"
+    } (min: ${(SNIPER_MIN_NEYNAR_SCORE * 100).toFixed(0)}%) - ${
+      neynarPasses ? "✓" : "✗"
+    }${SNIPER_NEYNAR_GATE_ENABLED ? "" : " (gate off)"}`,
+  );
+  console.log(
+    `[sniper] Twitter: ${
+      twitterFollowers !== undefined ? twitterFollowers.toLocaleString() : "N/A"
+    } (min: ${MIN_TWITTER_MINIMUM.toLocaleString()}) - ${
+      twitterMinimumPasses ? "✓" : "✗"
+    }`,
+  );
+  console.log(
+    `[sniper] Farcaster: ${
+      farcasterFollowers !== undefined ? farcasterFollowers.toLocaleString() : "N/A"
+    } (min: ${MIN_FARCASTER_FOLLOWERS.toLocaleString()}) - ${
+      farcasterPasses ? "✓" : "✗"
+    }`,
+  );
+  if (creatorInfo.twitterHandle) {
+    console.log(`[sniper] Twitter handle: @${creatorInfo.twitterHandle}`);
+  }
+
+  // ALL conditions must pass: Twitter >= 5K AND (Twitter >= 100K OR Farcaster >= 10K) AND not spam
+  const passes = neynarPasses && twitterMinimumPasses && followerPasses;
+
+  if (!passes) {
+    if (SNIPER_NEYNAR_GATE_ENABLED && !neynarPasses && !twitterBigAccount) {
+      if (neynarScore !== undefined) {
+        reasons.push(`neynar_low: ${(neynarScore * 100).toFixed(0)}%`);
+      } else {
+        reasons.push("neynar_unavailable");
+      }
+    }
+
+    if (!twitterMinimumPasses) {
+      reasons.push(`twitter_below_5k: ${twitterFollowers?.toLocaleString() ?? 0}`);
+    }
+
+    if (!followerPasses) {
+      const twitterStr =
+        twitterFollowers !== undefined ? `${(twitterFollowers / 1000).toFixed(0)}K` : "N/A";
+      const farcasterStr =
+        farcasterFollowers !== undefined ? `${(farcasterFollowers / 1000).toFixed(0)}K` : "N/A";
+      reasons.push(`followers_low: tw=${twitterStr}, fc=${farcasterStr}`);
+    }
+
+  }
+
+  return { passes, reasons };
+};
+
+async function validateTokenFast(token: TokenInfo): Promise<ValidationResult> {
   const startTime = Date.now();
   const reasons: string[] = [];
+
+  if (!token.creator) {
+    reasons.push("creator_missing");
+    return { passes: false, reasons };
+  }
+
+  const addr = token.creator.toLowerCase();
+  const neynarData = await getNeynarUserByAddress(addr, "fast");
+
+  if (!neynarData) {
+    reasons.push("creator_not_found_fast");
+    return { passes: false, reasons };
+  }
+
+  if (PLATFORM_FIDS.has(neynarData.fid)) {
+    reasons.push(`platform_fid: ${neynarData.fid}`);
+    return { passes: false, reasons };
+  }
+
+  let twitterFollowers: number | undefined;
+  if (neynarData.twitterHandle) {
+    const followers = await getTwitterFollowers(neynarData.twitterHandle, "fast");
+    if (followers !== null) {
+      twitterFollowers = followers;
+    }
+  }
+
+  const creatorInfo: CreatorInfo = {
+    fid: neynarData.fid,
+    username: neynarData.username,
+    neynarScore: neynarData.score,
+    farcasterFollowers: neynarData.followers,
+    twitterHandle: neynarData.twitterHandle,
+    twitterFollowers,
+    platform: token.platform,
+  };
+
+  const evaluation = evaluateCreator(creatorInfo);
+  if (evaluation.passes) {
+    const spamCheck = checkCreatorSpamAndRecord(creatorInfo, token.address);
+    if (!spamCheck.passes) {
+      return {
+        passes: false,
+        reasons: [...evaluation.reasons, spamCheck.reason ?? "spam"],
+        creatorInfo,
+      };
+    }
+  }
+  const elapsed = Date.now() - startTime;
+  console.log(`[sniper] Fast validation took ${elapsed}ms - ${evaluation.passes ? "PASSED" : "REJECTED"}`);
+
+  return { ...evaluation, creatorInfo };
+}
+
+async function validateToken(token: TokenInfo): Promise<ValidationResult> {
+  const startTime = Date.now();
 
   console.log(`[sniper] Validating ${token.address} from ${token.platform}...`);
 
   // Parallel lookups
   let creatorInfo: CreatorInfo | null = null;
+  const reasons: string[] = [];
 
   if (token.platform === "clanker") {
     creatorInfo = await getClankerCreator(token.address);
@@ -1085,86 +1637,22 @@ async function validateToken(token: TokenInfo): Promise<ValidationResult> {
     return { passes: false, reasons };
   }
 
-  // === STRICT VALIDATION ===
-  const neynarScore = creatorInfo.neynarScore;
-  const twitterFollowers = creatorInfo.twitterFollowers;
-  const farcasterFollowers = creatorInfo.farcasterFollowers;
-
-  // 1. Neynar score check (DISABLED - keeping code for future use)
-  // const neynarPasses = neynarScore !== undefined && neynarScore >= MIN_NEYNAR;
-  const neynarPasses = true; // Disabled - many legit creators aren't on Neynar
-
-  // 2. Twitter minimum check (REQUIRED: if Twitter exists, must be >= 5K)
-  const twitterMinimumPasses = twitterFollowers === undefined || twitterFollowers >= MIN_TWITTER_MINIMUM;
-
-  // 3. Follower check (REQUIRED: Twitter >= 100K OR Farcaster >= 10K)
-  const twitterPasses = twitterFollowers !== undefined && twitterFollowers >= MIN_TWITTER_FOLLOWERS;
-  const farcasterPasses = farcasterFollowers !== undefined && farcasterFollowers >= MIN_FARCASTER_FOLLOWERS;
-  const followerPasses = twitterPasses || farcasterPasses;
-
-  // 3. Spam check - limit tokens per creator
-  const creatorKey = creatorInfo.fid?.toString() || creatorInfo.twitterHandle || "unknown";
-  const now = Date.now();
-  let spamPasses = true;
-
-  if (creatorKey !== "unknown") {
-    const creatorData = creatorTokenCount.get(creatorKey);
-    if (creatorData) {
-      // Clean up old entries
-      if (now - creatorData.firstSeen > CREATOR_WINDOW_MS) {
-        creatorTokenCount.set(creatorKey, { count: 1, firstSeen: now });
-      } else if (creatorData.count >= MAX_TOKENS_PER_CREATOR) {
-        spamPasses = false;
-        console.log(`[sniper] ⚠️ Spam detected: ${creatorKey} has ${creatorData.count} tokens in 24h`);
-      } else {
-        creatorData.count++;
-      }
-    } else {
-      creatorTokenCount.set(creatorKey, { count: 1, firstSeen: now });
+  const evaluation = evaluateCreator(creatorInfo);
+  if (evaluation.passes) {
+    const spamCheck = checkCreatorSpamAndRecord(creatorInfo, token.address);
+    if (!spamCheck.passes) {
+      evaluation.passes = false;
+      evaluation.reasons.push(spamCheck.reason ?? "spam");
     }
   }
-
-  // Log the checks
-  console.log(`[sniper] Neynar: ${neynarScore !== undefined ? `${(neynarScore * 100).toFixed(0)}%` : "N/A"} (DISABLED - not checking)`);
-  console.log(`[sniper] Twitter: ${twitterFollowers !== undefined ? twitterFollowers.toLocaleString() : "N/A"} (min: ${MIN_TWITTER_MINIMUM.toLocaleString()}) - ${twitterMinimumPasses ? "✓" : "✗"}`);
-  console.log(`[sniper] Farcaster: ${farcasterFollowers !== undefined ? farcasterFollowers.toLocaleString() : "N/A"} (min: ${MIN_FARCASTER_FOLLOWERS.toLocaleString()}) - ${farcasterPasses ? "✓" : "✗"}`);
-  if (creatorInfo.twitterHandle) {
-    console.log(`[sniper] Twitter handle: @${creatorInfo.twitterHandle}`);
-  }
-
-  // ALL conditions must pass: Twitter >= 5K AND (Twitter >= 100K OR Farcaster >= 10K) AND not spam
-  // Note: Neynar check disabled - neynarPasses always true
-  const passes = neynarPasses && twitterMinimumPasses && followerPasses && spamPasses;
-
-  if (!passes) {
-    // Neynar check disabled - keeping code for future use
-    // if (!neynarPasses) {
-    //   if (neynarScore !== undefined) {
-    //     reasons.push(`neynar_low: ${(neynarScore * 100).toFixed(0)}%`);
-    //   } else {
-    //     reasons.push("neynar_unavailable");
-    //   }
-    // }
-
-    if (!twitterMinimumPasses) {
-      reasons.push(`twitter_below_5k: ${twitterFollowers?.toLocaleString() ?? 0}`);
-    }
-
-    if (!followerPasses) {
-      const twitterStr = twitterFollowers !== undefined ? `${(twitterFollowers / 1000).toFixed(0)}K` : "N/A";
-      const farcasterStr = farcasterFollowers !== undefined ? `${(farcasterFollowers / 1000).toFixed(0)}K` : "N/A";
-      reasons.push(`followers_low: tw=${twitterStr}, fc=${farcasterStr}`);
-    }
-
-    if (!spamPasses) {
-      reasons.push(`spam: ${creatorKey}`);
-    }
-  }
-
   const elapsed = Date.now() - startTime;
-  console.log(`[sniper] Validation took ${elapsed}ms - ${passes ? "PASSED" : "REJECTED"}`);
+  console.log(
+    `[sniper] Validation took ${elapsed}ms - ${
+      evaluation.passes ? "PASSED" : "REJECTED"
+    }`,
+  );
 
-  return { passes, reasons, creatorInfo };
+  return { ...evaluation, creatorInfo };
 }
 
 async function validateTokenWithRetry(token: TokenInfo, maxRetries: number = 5): Promise<ValidationResult> {
@@ -1388,6 +1876,40 @@ async function sendLiquidityAlert(
   }
 }
 
+async function sendCreateAlert(
+  token: TokenInfo,
+  creatorInfo: CreatorInfo,
+): Promise<void> {
+  const tokenKey = token.address.toLowerCase();
+  if (createAlertedTokens.has(tokenKey)) {
+    return;
+  }
+  createAlertedTokens.set(tokenKey, true);
+
+  // Log in background (avoid blocking the alert path on disk I/O)
+  void logPassedToken(token, creatorInfo);
+
+  const score = calculateCreatorScore(creatorInfo);
+
+  const alert: TokenAlert = {
+    token: token.address,
+    symbol: token.symbol,
+    name: token.name,
+    platform: token.platform,
+    score,
+    neynarScore: creatorInfo.neynarScore,
+    twitterFollowers: creatorInfo.twitterFollowers,
+    farcasterFollowers: creatorInfo.farcasterFollowers,
+    poolAddress: token.poolAddress,
+    creatorFid: creatorInfo.fid,
+    dexscreenerUrl: `https://dexscreener.com/base/${token.address}`,
+    twitterHandle: creatorInfo.twitterHandle,
+    farcasterUsername: creatorInfo.username,
+  };
+
+  await sendTelegramAlert(alert);
+}
+
 // Check liquidity for all pending tokens
 async function checkWatchlistLiquidity(): Promise<void> {
   const now = Date.now();
@@ -1445,13 +1967,27 @@ async function checkWatchlistLiquidity(): Promise<void> {
           if (liquidity >= MIN_LIQUIDITY_USD) {
             // LIQUIDITY THRESHOLD MET - SEND ALERT!
             console.log(`[sniper] 🚀 LIQUIDITY HIT! ${pending.token.symbol || address}: $${liquidity.toLocaleString()}`);
-            // Pass metrics to alert for volume/buys/sells data
-            await sendLiquidityAlert(pending.token, pending.creatorInfo, liquidity, {
-              totalVolumeH24: metrics.totalVolumeH24,
-              totalBuysH1: metrics.totalBuysH1,
-              totalSellsH1: metrics.totalSellsH1,
-              priceChangeH1: metrics.priceChangeH1,
-            });
+            const tokenKey = pending.token.address.toLowerCase();
+            const shouldSendLiquidity =
+              SNIPER_ALERT_ON_LIQUIDITY &&
+              (SNIPER_LIQUIDITY_ALERT_AFTER_CREATE ||
+                !createAlertedTokens.has(tokenKey));
+
+            if (shouldSendLiquidity) {
+              // Pass metrics to alert for volume/buys/sells data
+              await sendLiquidityAlert(pending.token, pending.creatorInfo, liquidity, {
+                totalVolumeH24: metrics.totalVolumeH24,
+                totalBuysH1: metrics.totalBuysH1,
+                totalSellsH1: metrics.totalSellsH1,
+                priceChangeH1: metrics.priceChangeH1,
+              });
+            } else {
+              // Still log the hit for visibility, even if Telegram is skipped.
+              const reason = !SNIPER_ALERT_ON_LIQUIDITY
+                ? "SNIPER_ALERT_ON_LIQUIDITY disabled"
+                : "already alerted on create";
+              console.log(`[sniper] 📵 Liquidity alert skipped (${reason})`);
+            }
             toRemove.add(address);
             return;
           }
@@ -1559,25 +2095,36 @@ async function handleClankerEvent(log: Log): Promise<void> {
     platform: "clanker",
   };
 
-  // Wait for Clanker API to index with retry logic
-  const validation = await validateTokenWithRetry(token, 3);
-  const totalTime = Date.now() - eventTime;
+  const fastValidation = await validateTokenFast(token);
+  const fastTime = Date.now() - eventTime;
 
-  if (validation.passes && validation.creatorInfo) {
-    const twitterFollowers = validation.creatorInfo.twitterFollowers ?? 0;
+  if (fastValidation.passes && fastValidation.creatorInfo) {
+    const twitterFollowers = fastValidation.creatorInfo.twitterFollowers ?? 0;
 
-    // 100K+ Twitter followers = instant alert (skip liquidity check)
     if (twitterFollowers >= MIN_TWITTER_FOLLOWERS) {
-      console.log(`[sniper] 🚀 BIG ACCOUNT (${twitterFollowers.toLocaleString()} Twitter) - Sending instant alert!`);
-      await sendLiquidityAlert(token, validation.creatorInfo, 0, {}); // 0 liquidity = not checked
-    } else {
-      // < 100K Twitter = wait for liquidity
-      console.log(`[sniper] ✅ TOKEN PASSED! Adding to watchlist... (${totalTime}ms total)`);
-      addToWatchlist(token, validation.creatorInfo);
+      console.log(
+        `[sniper] 🚀 BIG ACCOUNT (${twitterFollowers.toLocaleString()} Twitter) - Sending create alert! (${fastTime}ms)`,
+      );
+      if (SNIPER_ALERT_ON_CREATE) {
+        await sendCreateAlert(token, fastValidation.creatorInfo);
+      }
+      return;
     }
-  } else {
-    console.log(`[sniper] ❌ Token rejected: ${validation.reasons.join(", ")} (${totalTime}ms)`);
+
+    console.log(`[sniper] ✅ TOKEN PASSED FAST! (${fastTime}ms)`);
+    if (SNIPER_ALERT_ON_CREATE) {
+      await sendCreateAlert(token, fastValidation.creatorInfo);
+    }
+    if (shouldWatchLiquidity()) {
+      addToWatchlist(token, fastValidation.creatorInfo);
+    }
+    return;
   }
+
+  console.log(
+    `[sniper] ⏳ Fast validation failed (${fastTime}ms): ${fastValidation.reasons.join(", ") || "unknown"}`,
+  );
+  scheduleSlowValidation(token, eventTime);
 }
 
 async function handleZoraEvent(log: Log): Promise<void> {
@@ -1626,8 +2173,10 @@ async function handleZoraEvent(log: Log): Promise<void> {
   // Topics: [0]=sig, [1]=caller (indexed), [2]=payoutRecipient (indexed), [3]=platformReferrer (indexed)
   const rawCoin = args.coin;
   const rawCaller = args.caller ?? topics?.[1]; // caller is indexed
+  const rawPayoutRecipient = args.payoutRecipient ?? topics?.[2]; // payoutRecipient is indexed
   const coinAddress = normalizeAddress(rawCoin);
   const callerAddress = normalizeAddress(rawCaller);
+  const payoutRecipientAddress = normalizeAddress(rawPayoutRecipient);
 
   // Extract additional info from decoded args
   const tokenName = args.name;
@@ -1659,11 +2208,14 @@ async function handleZoraEvent(log: Log): Promise<void> {
 
   console.log(`[sniper] Coin: ${coinAddress}`);
   if (callerAddress) console.log(`[sniper] Caller: ${callerAddress}`);
+  if (payoutRecipientAddress) console.log(`[sniper] Payout: ${payoutRecipientAddress}`);
   if (tokenName) console.log(`[sniper] Name: ${tokenName}`);
   if (tokenSymbol) console.log(`[sniper] Symbol: ${tokenSymbol}`);
   if (poolAddress) console.log(`[sniper] Pool: ${poolAddress}`);
   if (poolKeyHash) console.log(`[sniper] PoolKeyHash: ${poolKeyHash}`);
   if (poolKey) console.log(`[sniper] PoolKey:`, JSON.stringify(poolKey, (_, v) => typeof v === 'bigint' ? v.toString() : v));
+
+  const creatorAddress = payoutRecipientAddress ?? callerAddress ?? undefined;
 
   const token: TokenInfo = {
     address: coinAddress,
@@ -1673,30 +2225,40 @@ async function handleZoraEvent(log: Log): Promise<void> {
     blockNumber: log.blockNumber!,
     timestamp: eventTime,
     platform: "zora",
-    creator: callerAddress ?? undefined,
+    creator: creatorAddress,
     poolAddress: normalizeAddress(poolAddress) ?? undefined,
   };
 
-  const validation = await validateTokenWithRetry(token, 3);
-  const totalTime = Date.now() - eventTime;
+  const fastValidation = await validateTokenFast(token);
+  const fastTime = Date.now() - eventTime;
 
-  if (validation.passes && validation.creatorInfo) {
-    const twitterFollowers = validation.creatorInfo.twitterFollowers ?? 0;
+  if (fastValidation.passes && fastValidation.creatorInfo) {
+    const twitterFollowers = fastValidation.creatorInfo.twitterFollowers ?? 0;
 
-    // 100K+ Twitter followers = instant alert (skip liquidity check)
     if (twitterFollowers >= MIN_TWITTER_FOLLOWERS) {
-      console.log(`[sniper] 🚀 BIG ACCOUNT (${twitterFollowers.toLocaleString()} Twitter) - Sending instant alert!`);
-      await sendLiquidityAlert(token, validation.creatorInfo, 0, {}); // 0 liquidity = not checked
-    } else {
-      // < 100K Twitter = wait for liquidity
-      console.log(`[sniper] ✅ Zora token passed! Adding to watchlist... (${totalTime}ms total)`);
-      addToWatchlist(token, validation.creatorInfo);
+      console.log(
+        `[sniper] 🚀 BIG ACCOUNT (${twitterFollowers.toLocaleString()} Twitter) - Sending create alert! (${fastTime}ms)`,
+      );
+      if (SNIPER_ALERT_ON_CREATE) {
+        await sendCreateAlert(token, fastValidation.creatorInfo);
+      }
+      return;
     }
-  } else {
-    console.log(
-      `[sniper] ❌ Zora token rejected: ${validation.reasons.join(", ") || "unknown"} (${totalTime}ms)`
-    );
+
+    console.log(`[sniper] ✅ Zora token passed FAST! (${fastTime}ms)`);
+    if (SNIPER_ALERT_ON_CREATE) {
+      await sendCreateAlert(token, fastValidation.creatorInfo);
+    }
+    if (shouldWatchLiquidity()) {
+      addToWatchlist(token, fastValidation.creatorInfo);
+    }
+    return;
   }
+
+  console.log(
+    `[sniper] ⏳ Fast validation failed (${fastTime}ms): ${fastValidation.reasons.join(", ") || "unknown"}`,
+  );
+  scheduleSlowValidation(token, eventTime);
 }
 
 /**
@@ -1725,14 +2287,23 @@ async function handleZoraVIPEvent(log: Log): Promise<void> {
 
   // Get caller address - topics[1] is indexed caller
   const rawCaller = args.caller ?? topics?.[1];
+  const rawPayoutRecipient = args.payoutRecipient ?? topics?.[2];
   const callerAddress = normalizeAddress(rawCaller);
+  const payoutRecipientAddress = normalizeAddress(rawPayoutRecipient);
 
-  if (!callerAddress) {
+  if (!callerAddress && !payoutRecipientAddress) {
     return; // Can't determine caller
   }
 
-  // Check if caller is in VIP list
-  if (!ZORA_VIP_ADDRESSES.has(callerAddress.toLowerCase())) {
+  const vipAddress =
+    payoutRecipientAddress && ZORA_VIP_ADDRESSES.has(payoutRecipientAddress.toLowerCase())
+      ? payoutRecipientAddress
+      : callerAddress && ZORA_VIP_ADDRESSES.has(callerAddress.toLowerCase())
+        ? callerAddress
+        : null;
+
+  // Check if caller or payoutRecipient is in VIP list
+  if (!vipAddress) {
     return; // Not a VIP, silently skip
   }
 
@@ -1740,7 +2311,7 @@ async function handleZoraVIPEvent(log: Log): Promise<void> {
   console.log(`\n[sniper] 🌟 VIP CONTENT COIN DETECTED at ${new Date().toISOString()}`);
   console.log(`[sniper] TX: ${log.transactionHash}`);
   console.log(`[sniper] Block: ${log.blockNumber}`);
-  console.log(`[sniper] VIP Caller: ${callerAddress}`);
+  console.log(`[sniper] VIP Address: ${vipAddress}`);
 
   // Extract coin address and other info
   const rawCoin = args.coin;
@@ -1766,12 +2337,12 @@ async function handleZoraVIPEvent(log: Log): Promise<void> {
     blockNumber: log.blockNumber!,
     timestamp: eventTime,
     platform: "zora",
-    creator: callerAddress,
+    creator: vipAddress,
     poolAddress: normalizeAddress(poolAddress) ?? undefined,
   };
 
   // VIPs don't need validation - create creator info with mapped username
-  const vipUsername = VIP_ADDRESS_MAP.get(callerAddress.toLowerCase()) ?? "VIP";
+  const vipUsername = VIP_ADDRESS_MAP.get(vipAddress.toLowerCase()) ?? "VIP";
   const vipCreatorInfo: CreatorInfo = {
     username: vipUsername,
     platform: "zora",
@@ -1779,7 +2350,12 @@ async function handleZoraVIPEvent(log: Log): Promise<void> {
   };
 
   console.log(`[sniper] ✅ VIP token from ${vipUsername} - Adding to watchlist immediately!`);
-  addToWatchlist(token, vipCreatorInfo);
+  if (SNIPER_ALERT_ON_CREATE) {
+    await sendCreateAlert(token, vipCreatorInfo);
+  }
+  if (shouldWatchLiquidity()) {
+    addToWatchlist(token, vipCreatorInfo);
+  }
 }
 
 // ============= MAIN =============
@@ -1791,7 +2367,18 @@ async function main(): Promise<void> {
   console.log(`[sniper] WebSocket RPC: ${WS_RPC_URL}`);
   console.log(`[sniper] Clanker Factory: ${CLANKER_FACTORY}`);
   console.log(`[sniper] Zora Factory: ${ZORA_FACTORY}`);
-  console.log(`[sniper] Neynar Score: DISABLED`);
+  console.log(`[sniper] Create Alerts: ${SNIPER_ALERT_ON_CREATE ? "ON" : "OFF"} (fast=${SNIPER_FAST_TIMEOUT_MS}ms)`);
+  console.log(
+    `[sniper] Liquidity Alerts: ${SNIPER_ALERT_ON_LIQUIDITY ? "ON" : "OFF"} (after-create=${SNIPER_LIQUIDITY_ALERT_AFTER_CREATE ? "ON" : "OFF"})`,
+  );
+  console.log(
+    `[sniper] Slow Fallback: ${SNIPER_ENABLE_SLOW_FALLBACK ? "ON" : "OFF"} (concurrency=${SNIPER_SLOW_VALIDATION_CONCURRENCY})`,
+  );
+  console.log(
+    `[sniper] Neynar Gate: ${
+      SNIPER_NEYNAR_GATE_ENABLED ? "ON" : "OFF"
+    } (min=${(SNIPER_MIN_NEYNAR_SCORE * 100).toFixed(0)}%)`,
+  );
   console.log(`[sniper] Min Twitter: ${MIN_TWITTER_MINIMUM.toLocaleString()}`);
   console.log(`[sniper] Min Farcaster: ${MIN_FARCASTER_FOLLOWERS.toLocaleString()}`);
   console.log(`[sniper] Min Liquidity: $${MIN_LIQUIDITY_USD.toLocaleString()}`);
@@ -1821,7 +2408,7 @@ async function main(): Promise<void> {
     ? `\n• Auto-Buy: ENABLED (${autoBuyStatus.config.amountEth} ETH)`
     : "\n• Auto-Buy: DISABLED";
   void sendSimpleMessage(
-    `🎯 Sniper Bot started\n• Min Liquidity: $${MIN_LIQUIDITY_USD.toLocaleString()}\n• Watch Time: 1 hour${autoBuyMsg}`,
+    `🎯 Sniper Bot started\n• Create Alerts: ${SNIPER_ALERT_ON_CREATE ? "ON" : "OFF"}\n• Liquidity Alerts: ${SNIPER_ALERT_ON_LIQUIDITY ? "ON" : "OFF"}\n• Min Liquidity: $${MIN_LIQUIDITY_USD.toLocaleString()}\n• Watch Time: 1 hour${autoBuyMsg}`,
   );
 
   // Create WebSocket client
@@ -1867,6 +2454,11 @@ async function main(): Promise<void> {
   let consecutiveErrors = 0;
   const MAX_CONSECUTIVE_ERRORS = 5;
   let isResubscribing = false;
+  let lastResubscribeAt = 0;
+  let lastStaleProbeAt = 0;
+  let lastStaleWarningAt = 0;
+  let lastNodeStallWarningAt = 0;
+  let stalledSince: number | null = null;
 
   // Store unwatch functions for circuit breaker resubscribe
   let unwatchClanker: (() => void) | null = null;
@@ -1886,12 +2478,26 @@ async function main(): Promise<void> {
   }
 
   // Circuit breaker resubscribe function
-  async function resubscribeAll() {
+  async function resubscribeAll(reason: string) {
     if (isResubscribing) return;
+    const now = Date.now();
+    if (
+      SNIPER_RESUBSCRIBE_COOLDOWN_MS > 0 &&
+      now - lastResubscribeAt < SNIPER_RESUBSCRIBE_COOLDOWN_MS
+    ) {
+      const waitMs = SNIPER_RESUBSCRIBE_COOLDOWN_MS - (now - lastResubscribeAt);
+      console.warn(
+        `[sniper] 🔁 Resubscribe suppressed (cooldown ${Math.ceil(waitMs / 1000)}s) reason=${reason}`,
+      );
+      return;
+    }
+    lastResubscribeAt = now;
     isResubscribing = true;
 
-    console.log("[sniper] 🔄 Circuit breaker triggered - resubscribing to all events...");
-    await sendSimpleMessage("🔄 Sniper: Circuit breaker triggered - resubscribing...");
+    console.log(`[sniper] 🔄 Resubscribing to all events (reason=${reason})...`);
+    await sendSimpleMessage(
+      `🔄 Sniper: resubscribing...\n• Reason: ${reason}`,
+    );
 
     // Unsubscribe from all
     try {
@@ -1955,7 +2561,7 @@ async function main(): Promise<void> {
         consecutiveErrors++;
         console.error(`[sniper] Clanker watch error (${consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS}):`, error);
         if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-          await resubscribeAll();
+          await resubscribeAll("clanker watch error");
         }
       },
     });
@@ -1994,7 +2600,7 @@ async function main(): Promise<void> {
         consecutiveErrors++;
         console.error(`[sniper] Zora watch error (${consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS}):`, error);
         if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-          await resubscribeAll();
+          await resubscribeAll("zora watch error");
         }
       },
     });
@@ -2072,16 +2678,65 @@ async function main(): Promise<void> {
     process.exit(0);
   });
 
+  const probeRecentFactoryLogs = async (toBlock: bigint): Promise<number> => {
+    if (SNIPER_STALE_PROBE_BLOCKS <= 0n) return 0;
+    const fromBlock =
+      toBlock > SNIPER_STALE_PROBE_BLOCKS ? toBlock - SNIPER_STALE_PROBE_BLOCKS : 0n;
+    if (fromBlock >= toBlock) return 0;
+
+    const results = await Promise.allSettled([
+      client.getLogs({
+        address: CLANKER_FACTORY as `0x${string}`,
+        event: CLANKER_TOKEN_CREATED,
+        fromBlock,
+        toBlock,
+      }),
+      client.getLogs({
+        address: ZORA_FACTORY as `0x${string}`,
+        event: ZORA_COIN_CREATED,
+        fromBlock,
+        toBlock,
+      }),
+      client.getLogs({
+        address: ZORA_FACTORY as `0x${string}`,
+        event: ZORA_CREATOR_COIN_CREATED,
+        fromBlock,
+        toBlock,
+      }),
+      client.getLogs({
+        address: ZORA_FACTORY as `0x${string}`,
+        event: ZORA_CREATOR_COIN_CREATED_V2,
+        fromBlock,
+        toBlock,
+      }),
+      client.getLogs({
+        address: ZORA_FACTORY as `0x${string}`,
+        event: ZORA_COIN_CREATED_V4,
+        fromBlock,
+        toBlock,
+      }),
+    ]);
+
+    let found = 0;
+    for (const result of results) {
+      if (result.status === "fulfilled") {
+        found += (result.value as Log[]).length;
+      }
+    }
+
+    return found;
+  };
+
   // Health check and heartbeat every 60 seconds
   let lastHealthCheckBlock = BigInt(0);
-  const EVENT_STALE_THRESHOLD_MS = 10 * 60 * 1000; // 10 minutes without events is concerning
   setInterval(async () => {
     try {
       const currentBlock = await client.getBlockNumber();
       const blockProgress = currentBlock - lastHealthCheckBlock;
       lastHealthCheckBlock = currentBlock;
 
-      const timeSinceLastEvent = Date.now() - lastEventAt;
+      const now = Date.now();
+      const timeSinceLastEvent = now - lastEventAt;
       const eventAgeMinutes = Math.floor(timeSinceLastEvent / 60000);
 
       // Check Zora API health
@@ -2090,18 +2745,57 @@ async function main(): Promise<void> {
 
       console.log(`[sniper] ♥️ Heartbeat - Block: ${currentBlock} (+${blockProgress}) - Last event: ${eventAgeMinutes}m ago - Zora API: ${apiStatus} - ${new Date().toISOString()}`);
 
-      // Check if we're seeing new blocks
-      if (blockProgress === BigInt(0) && lastBlockSeen > BigInt(0)) {
-        console.warn("[sniper] ⚠️ No new blocks seen in last minute");
+      if (blockProgress === BigInt(0)) {
+        if (stalledSince === null) {
+          stalledSince = now;
+        }
+        const stalledMs = now - stalledSince;
+        if (
+          SNIPER_STALE_WARNING_INTERVAL_MS === 0 ||
+          now - lastNodeStallWarningAt >= SNIPER_STALE_WARNING_INTERVAL_MS
+        ) {
+          lastNodeStallWarningAt = now;
+          console.warn(
+            `[sniper] ⚠️ Block number not advancing for ${Math.floor(stalledMs / 60000)}m - check local node + WS_RPC_URL`,
+          );
+        }
+      } else {
+        stalledSince = null;
       }
 
       // Check if events are stale (no events received for too long)
-      if (timeSinceLastEvent > EVENT_STALE_THRESHOLD_MS) {
-        console.warn(`[sniper] ⚠️ No events received in ${eventAgeMinutes} minutes - connection may be stale`);
-        // Trigger circuit breaker if events are too stale
-        if (timeSinceLastEvent > EVENT_STALE_THRESHOLD_MS * 2) {
-          console.error(`[sniper] ❌ Events stale for ${eventAgeMinutes} minutes - triggering circuit breaker`);
-          await resubscribeAll();
+      if (timeSinceLastEvent > SNIPER_EVENT_STALE_THRESHOLD_MS) {
+        if (
+          SNIPER_STALE_WARNING_INTERVAL_MS === 0 ||
+          now - lastStaleWarningAt >= SNIPER_STALE_WARNING_INTERVAL_MS
+        ) {
+          lastStaleWarningAt = now;
+          console.warn(
+            `[sniper] ⚠️ No factory events received in ${eventAgeMinutes} minutes`,
+          );
+        }
+
+        // If the node isn't advancing, resubscribing won't help.
+        if (blockProgress === BigInt(0)) {
+          return;
+        }
+
+        if (
+          SNIPER_STALE_PROBE_INTERVAL_MS === 0 ||
+          now - lastStaleProbeAt >= SNIPER_STALE_PROBE_INTERVAL_MS
+        ) {
+          lastStaleProbeAt = now;
+          const found = await probeRecentFactoryLogs(currentBlock);
+          if (found > 0) {
+            console.error(
+              `[sniper] ❌ Missed ${found} factory logs in last ${SNIPER_STALE_PROBE_BLOCKS.toString()} blocks - resubscribing`,
+            );
+            await resubscribeAll(`stale subscription (missed ${found} logs)`);
+          } else {
+            console.log(
+              `[sniper] 🔎 Stale probe: no factory logs in last ${SNIPER_STALE_PROBE_BLOCKS.toString()} blocks; staying subscribed`,
+            );
+          }
         }
       }
     } catch (error) {

@@ -71,7 +71,8 @@ cp .env.example .env.local
 # Run sniper bot (real-time, recommended)
 npm run sniper
 
-# Or run monitor (polling-based backup)
+# Optional: run monitor (polling-based backup). If you run both, disable monitor Telegram to avoid duplicates:
+# MONITOR_TELEGRAM_ENABLED=false
 npm run monitor
 ```
 
@@ -81,7 +82,7 @@ npm run monitor
 |---------|-------------|
 | `npm run sniper` | **Real-time sniper bot** - WebSocket event listener |
 | `npm run monitor` | Polling-based monitor (1 min interval) |
-| `npm run dev` | Ponder indexer (development) |
+| `npm run dev` | Ponder indexer (development) - not required for sniper/monitor |
 | `npm run start` | Ponder indexer (production) |
 | `npm run poll:launchpads` | One-off Clanker/Zora fetch |
 

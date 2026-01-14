@@ -32,7 +32,7 @@ export interface TokenAlert {
   symbol?: string;
   name?: string;
   platform?: string;
-  liquidity: number;
+  liquidity?: number;
   volume24h?: number;
   buysH1?: number;
   sellsH1?: number;
@@ -68,11 +68,14 @@ export const formatTokenAlert = (alert: TokenAlert): string => {
   // Helper to escape URL dots for MarkdownV2
   const escapeUrl = (url: string): string => url.replace(/\./g, '\\.');
 
-  // Big account = instant alert (70K+ Twitter, no liquidity check)
-  const isBigAccount = alert.liquidity === 0 && (alert.twitterFollowers ?? 0) >= 70000;
+  const isCreateAlert = alert.liquidity === undefined;
+  // Big account = create-time alert (70K+ Twitter)
+  const isBigAccount = isCreateAlert && (alert.twitterFollowers ?? 0) >= 70000;
 
   if (isBigAccount) {
-    lines.push(`🚀 *BIG ACCOUNT ALERT*`);
+    lines.push(`🚀 *BIG ACCOUNT \\(CREATE\\) ALERT*`);
+  } else if (isCreateAlert) {
+    lines.push(`⚡ *TOKEN CREATED*`);
   } else {
     lines.push(`🚨 *NEW PROMISING TOKEN*`);
   }
@@ -91,9 +94,9 @@ export const formatTokenAlert = (alert: TokenAlert): string => {
 
   lines.push(``);
   lines.push(`📊 *Metrics:*`);
-  if (isBigAccount) {
-    lines.push(`• Liquidity: ⚡ *INSTANT ALERT* \\(100K\\+ Twitter\\)`);
-  } else {
+  if (isCreateAlert) {
+    lines.push(`• Liquidity: ⏳ pending`);
+  } else if (typeof alert.liquidity === "number") {
     lines.push(`• Liquidity: $${formatNumber(alert.liquidity)}`);
   }
   if (alert.volume24h) {
